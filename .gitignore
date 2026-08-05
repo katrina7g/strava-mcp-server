@@ -1,0 +1,42 @@
+# Dependencies
+/node_modules/
+
+# Build output
+dist/
+
+# Env and local config files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# TypeScript build info
+*.tsbuildinfo
+
+# npm pack output
+*.tgz
+
+# MCP registry publisher output
+server.json
+
+# Private Strava data and generated local cache.
+# Keep a temporary export only in local-data/; it must never be committed.
+/local-data/
+/local-cache/
+/.strava-mcp-server/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
