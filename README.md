@@ -25,7 +25,7 @@ deployment, webhooks, or automatic Strava synchronization.
 ## Install and verify
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/katrina7g/strava-mcp-server.git
 cd strava-mcp-server
 npm install
 
@@ -84,7 +84,7 @@ nested inside it (or vice versa). This prevents generated cache files from
 being written into the immutable source export.
 
 ## Data and Git hygiene
-Its recommended not to commit a real Strava export, generated database, API credential, or
+Do not commit a real Strava export, generated database, API credential, or
 privacy-sensitive test artifact. The repository ignores the following local
 paths and SQLite cache files:
 

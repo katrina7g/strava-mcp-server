@@ -1,8 +1,9 @@
 {
   "name": "strava-mcp-server",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Local, read-only MCP server for Strava data exports.",
   "main": "./dist/server.js",
+  "private": true,
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
@@ -11,10 +12,28 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "strava",
+    "mcp",
+    "model-context-protocol",
+    "training",
+    "fitness",
+    "local-first"
+  ],
+  "author": "katrina7g",
+  "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/katrina7g/strava-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/katrina7g/strava-mcp-server/issues"
+  },
+  "homepage": "https://github.com/katrina7g/strava-mcp-server#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.4.3"
