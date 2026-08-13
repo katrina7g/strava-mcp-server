@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 3;
+const LATEST_SCHEMA_VERSION = 5;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -52,6 +52,8 @@ function migrate(database: Database): void {
     if (currentVersion < 1) migrationOne(database);
     if (currentVersion < 2) migrationTwo(database);
     if (currentVersion < 3) migrationThree(database);
+    if (currentVersion < 4) migrationFour(database);
+    if (currentVersion < 5) migrationFive(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -154,6 +156,70 @@ function migrationThree(database: Database): void {
     DROP TABLE source_manifest;
     ALTER TABLE source_manifest_next RENAME TO source_manifest;
     CREATE INDEX source_manifest_snapshot_path ON source_manifest(snapshot_id, relative_path);
+  `);
+}
+
+/** Catalog records will be imported in the next phase. These tables retain
+ * every parsed source row and the durable, current activity state separately. */
+function migrationFour(database: Database): void {
+  database.exec(`
+    ALTER TABLE activities ADD COLUMN catalog_row_hash TEXT;
+    ALTER TABLE activities ADD COLUMN catalog_map_version INTEGER;
+    ALTER TABLE activities ADD COLUMN first_seen_snapshot_id INTEGER REFERENCES export_snapshots(id);
+    ALTER TABLE activities ADD COLUMN last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id);
+    ALTER TABLE activities ADD COLUMN last_observed_at TEXT;
+    ALTER TABLE activities ADD COLUMN observation_status TEXT NOT NULL DEFAULT 'observed';
+
+    CREATE TABLE activity_catalog_rows (
+      id INTEGER PRIMARY KEY,
+      snapshot_id INTEGER NOT NULL REFERENCES export_snapshots(id),
+      activity_id TEXT,
+      row_number INTEGER NOT NULL,
+      row_hash TEXT NOT NULL,
+      column_map_version INTEGER NOT NULL,
+      raw_values_json TEXT NOT NULL,
+      parsed_values_json TEXT NOT NULL,
+      parse_status TEXT NOT NULL,
+      parse_error_summary TEXT,
+      observed_at TEXT NOT NULL,
+      UNIQUE(snapshot_id, row_number)
+    );
+    CREATE INDEX activity_catalog_rows_snapshot_activity
+      ON activity_catalog_rows(snapshot_id, activity_id);
+    CREATE INDEX activities_last_seen_snapshot
+      ON activities(last_seen_snapshot_id);
+  `);
+}
+
+function migrationFive(database: Database): void {
+  database.exec(`
+    ALTER TABLE activities ADD COLUMN name TEXT;
+    ALTER TABLE activities ADD COLUMN description TEXT;
+    ALTER TABLE activities ADD COLUMN moving_seconds REAL;
+    ALTER TABLE activities ADD COLUMN distance_miles REAL;
+    ALTER TABLE activities ADD COLUMN elevation_gain_meters REAL;
+    ALTER TABLE activities ADD COLUMN average_heart_rate REAL;
+    ALTER TABLE activities ADD COLUMN average_watts REAL;
+    ALTER TABLE activities ADD COLUMN relative_effort REAL;
+    ALTER TABLE activities ADD COLUMN commute INTEGER;
+
+    CREATE INDEX activities_search ON activities(observation_status, sport_type, started_at);
+    CREATE TABLE catalog_column_maps (
+      snapshot_id INTEGER NOT NULL REFERENCES export_snapshots(id),
+      source_path TEXT NOT NULL,
+      map_version INTEGER NOT NULL,
+      columns_json TEXT NOT NULL,
+      PRIMARY KEY(snapshot_id, source_path)
+    );
+    CREATE TABLE catalog_imports (
+      snapshot_id INTEGER PRIMARY KEY REFERENCES export_snapshots(id),
+      imported_at TEXT NOT NULL,
+      inserted_count INTEGER NOT NULL,
+      changed_count INTEGER NOT NULL,
+      unchanged_count INTEGER NOT NULL,
+      missing_count INTEGER NOT NULL,
+      invalid_count INTEGER NOT NULL
+    );
   `);
 }
 

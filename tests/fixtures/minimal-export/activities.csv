@@ -1,0 +1,3 @@
+Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain,Average Heart Rate,Average Watts,Relative Effort,Commute
+fixture-run,"Jan 2, 2026, 7:00:00 AM",Fixture Run,Run,1800,3.1,activities/fixture-run.gpx,1750,5000,55,148,,22,false
+fixture-walk,"Jan 3, 2026, 8:00:00 AM",Fixture Walk,Walk,2400,1.2,activities/fixture-walk.gpx,2300,1931.2,18,,,,false

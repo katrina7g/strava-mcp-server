@@ -3,12 +3,23 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { loadConfig, type ServerConfig } from "./config.js";
+import { aggregateTraining, getArchiveSummary, getDataSchema, searchActivities } from "./archive.js";
+import { importActivityCatalog } from "./catalog.js";
 import { closeDatabase, openDatabase } from "./database.js";
 import { validateExport } from "./validator.js";
 
 const SERVER_NAME = "strava-mcp-server";
 const SERVER_VERSION = "1.0.0";
 const MAX_TOOL_FINDINGS = 50;
+const MAX_PAGE_SIZE = 100;
+
+const optionalDate = z.string().datetime().optional();
+const optionalFiniteNumber = z.number().finite().optional();
+
+function configuredExport(config: ServerConfig): { exportDir: string } | { error: true; result: { isError: true; content: [{ type: "text"; text: string }] } } {
+  if (config.exportDir !== undefined) return { exportDir: config.exportDir };
+  return { error: true, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ code: "EXPORT_DIR_NOT_CONFIGURED", message: "Set STRAVA_EXPORT_DIR before accessing an export." }) }] } };
+}
 
 /**
  * Creates the server without opening a transport, which keeps the entry point
@@ -49,15 +60,11 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       inputSchema: z.object({}),
     },
     async () => {
-      if (config.exportDir === undefined) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: JSON.stringify({ code: "EXPORT_DIR_NOT_CONFIGURED", message: "Set STRAVA_EXPORT_DIR before validating an export." }) }],
-        };
-      }
+      const configured = configuredExport(config);
+      if ("error" in configured) return configured.result;
       const database = await openDatabase(config);
       try {
-        const report = await validateExport(config.exportDir, database);
+        const report = await validateExport(configured.exportDir, database);
         return {
           content: [{
             type: "text",
@@ -76,7 +83,75 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     },
   );
 
+  server.registerTool(
+    "import_activity_catalog",
+    {
+      title: "Import activity catalog",
+      description: "Imports the validated activities.csv catalog into the local database. Never changes the source export.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const configured = configuredExport(config);
+      if ("error" in configured) return configured.result;
+      const database = await openDatabase(config);
+      try {
+        const validation = await validateExport(configured.exportDir, database);
+        const snapshot = database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number };
+        const imported = await importActivityCatalog(configured.exportDir, database, snapshot.id);
+        return { content: [{ type: "text", text: JSON.stringify({ validation: { outcome: validation.outcome, delta: validation.summary }, catalogDelta: imported }) }] };
+      } finally { closeDatabase(database); }
+    },
+  );
+
+  server.registerTool(
+    "get_archive_summary",
+    { title: "Get archive summary", description: "Summarizes imported activity coverage and latest validation health." },
+    async () => withDatabase(config, (database) => getArchiveSummary(database)),
+  );
+
+  server.registerTool(
+    "get_data_schema",
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog"]).optional() }) },
+    async ({ domain }) => withDatabase(config, (database) => getDataSchema(database, domain)),
+  );
+
+  server.registerTool(
+    "search_activities",
+    {
+      title: "Search activities",
+      description: "Searches imported activities with sport, date, metric, and bounded pagination filters.",
+      inputSchema: z.object({
+        sports: z.array(z.string().trim().min(1)).max(20).optional(), startDate: optionalDate, endDate: optionalDate,
+        minDistanceMeters: optionalFiniteNumber, maxDistanceMeters: optionalFiniteNumber,
+        minDurationSeconds: optionalFiniteNumber, maxDurationSeconds: optionalFiniteNumber,
+        minRelativeEffort: optionalFiniteNumber, text: z.string().trim().max(200).optional(),
+        page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+        sortBy: z.enum(["startedAt", "distanceMeters", "durationSeconds"]).optional(), sortDirection: z.enum(["asc", "desc"]).optional(),
+      }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." }),
+    },
+    async (input) => withDatabase(config, (database) => searchActivities(database, input)),
+  );
+
+  server.registerTool(
+    "aggregate_training",
+    {
+      title: "Aggregate training", description: "Returns allowlisted activity aggregates grouped by day, week, month, or sport.",
+      inputSchema: z.object({
+        sports: z.array(z.string().trim().min(1)).max(20).optional(), startDate: optionalDate, endDate: optionalDate,
+        groupBy: z.enum(["day", "week", "month", "sport"]).optional(),
+        metrics: z.array(z.enum(["activityCount", "distanceMeters", "durationSeconds", "elevationGainMeters", "averageHeartRate", "averageWatts", "relativeEffort"])).min(1).max(7).optional(),
+      }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." }),
+    },
+    async (input) => withDatabase(config, (database) => aggregateTraining(database, input)),
+  );
+
   return server;
+}
+
+async function withDatabase(config: ServerConfig, action: (database: ReturnType<typeof openDatabase> extends Promise<infer T> ? T : never) => object): Promise<{ content: [{ type: "text"; text: string }] }> {
+  const database = await openDatabase(config);
+  try { return { content: [{ type: "text", text: JSON.stringify(action(database)) }] }; }
+  finally { closeDatabase(database); }
 }
 
 export async function main(): Promise<void> {

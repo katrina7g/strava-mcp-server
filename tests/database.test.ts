@@ -29,7 +29,7 @@ describe("Database initialization", () => {
     const snapshots = second.prepare("SELECT count(*) AS count FROM export_snapshots").get() as { count: number };
     closeDatabase(second);
 
-    expect(version.version).toBe(3);
+    expect(version.version).toBe(5);
     expect(snapshots.count).toBe(1);
   });
 
@@ -73,5 +73,16 @@ describe("Database initialization", () => {
     expect(databaseMode).toBe(0o600);
     expect(dataDirMode).toBe(0o700);
     expect(process.umask()).toBe(0o077);
+  });
+
+  it("creates catalog provenance and incremental activity-state schema", async () => {
+    const dataDir = await temporaryDataDir();
+    const database = await openDatabase(loadConfig({ STRAVA_MCP_DATA_DIR: dataDir }));
+    const catalogColumns = database.prepare("PRAGMA table_info(activity_catalog_rows)").all() as { name: string }[];
+    const activityColumns = database.prepare("PRAGMA table_info(activities)").all() as { name: string }[];
+    closeDatabase(database);
+
+    expect(catalogColumns.map((column) => column.name)).toEqual(expect.arrayContaining(["snapshot_id", "activity_id", "row_hash", "column_map_version", "raw_values_json", "parsed_values_json", "parse_status"]));
+    expect(activityColumns.map((column) => column.name)).toEqual(expect.arrayContaining(["catalog_row_hash", "first_seen_snapshot_id", "last_seen_snapshot_id", "observation_status"]));
   });
 });

@@ -97,4 +97,39 @@ describe("MCP server tool surface", () => {
     expect(payload.findingsTruncated).toBe(true);
     await client.close();
   });
+
+  it("imports a catalog and serves archive, schema, search, and aggregate tools", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\n1,Jan 1 2026 10:00:00 AM,Morning Run,Run,3600,6.2,activities/1.gpx,3500,10000,120\n2,Feb 1 2026 10:00:00 AM,Bike Ride,Ride,7200,12.4,activities/2.fit,7000,20000,300\n");
+    await writeFile(join(exportDir, "activities", "1.gpx"), "<gpx />"); await writeFile(join(exportDir, "activities", "2.fit"), "fit");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    const imported = JSON.parse(textContent(await client.callTool({ name: "import_activity_catalog", arguments: {} })));
+    const summary = JSON.parse(textContent(await client.callTool({ name: "get_archive_summary", arguments: {} })));
+    const schema = JSON.parse(textContent(await client.callTool({ name: "get_data_schema", arguments: { domain: "activities" } })));
+    const searched = JSON.parse(textContent(await client.callTool({ name: "search_activities", arguments: { sports: ["Run"], text: "Morning" } })));
+    const aggregated = JSON.parse(textContent(await client.callTool({ name: "aggregate_training", arguments: { groupBy: "sport", metrics: ["activityCount", "distanceMeters"] } })));
+    expect(imported.catalogDelta).toMatchObject({ inserted: 2 });
+    expect(summary.overview.activityCount).toBe(2);
+    expect(schema.activities.fields.some((field: { name: string }) => field.name === "distanceMeters")).toBe(true);
+    expect(searched.activities).toHaveLength(1);
+    expect(aggregated.groups).toEqual(expect.arrayContaining([expect.objectContaining({ period: "Run", activityCount: 1, distanceMeters: 10000 })]));
+    await client.close();
+  });
+
+  it("paginates safely and represents unavailable metrics as null", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    const rows = Array.from({ length: 3 }, (_, index) => `${index + 1},Jan ${index + 1} 2026 10:00:00 AM,Run ${index + 1},Run,1800,3,activities/${index + 1}.gpx,1700,4828,10`).join("\n");
+    await writeFile(join(exportDir, "activities.csv"), `Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\n${rows}\n`);
+    for (const index of [1, 2, 3]) await writeFile(join(exportDir, "activities", `${index}.gpx`), "<gpx />");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const firstPage = JSON.parse(textContent(await client.callTool({ name: "search_activities", arguments: { page: 1, pageSize: 2, sortDirection: "asc" } })));
+    const aggregate = JSON.parse(textContent(await client.callTool({ name: "aggregate_training", arguments: { groupBy: "sport", metrics: ["averageWatts", "averageHeartRate"] } })));
+    expect(firstPage.activities).toHaveLength(2);
+    expect(firstPage.pagination).toMatchObject({ page: 1, pageSize: 2, total: 3, hasMore: true });
+    expect(aggregate.groups).toEqual([{ period: "Run", averageWatts: null, averageHeartRate: null }]);
+    await client.close();
+  });
 });

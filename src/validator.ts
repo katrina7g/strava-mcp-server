@@ -127,7 +127,14 @@ export async function validateExport(exportDir: string, database: Database): Pro
   for (const path of ["activities.csv", "media.csv", "messaging.json"]) {
     const source = allFiles.includes(path);
     try {
-      availability[path] = !source ? "unavailable" : (await stat(resolve(root, path))).size === 0 ? "available-but-empty" : "available";
+      if (!source) {
+        availability[path] = "unavailable";
+      } else if (path.endsWith(".csv")) {
+        const csv = parseCsv(await readFile(resolve(root, path), "utf8"));
+        availability[path] = csv.rows.length === 0 ? "available-but-empty" : "available";
+      } else {
+        availability[path] = (await stat(resolve(root, path))).size === 0 ? "available-but-empty" : "available";
+      }
     } catch { availability[path] = "unavailable"; }
   }
   if (!allFiles.includes(REQUIRED_CATALOG)) findings.push({ code: "ACTIVITIES_CATALOG_MISSING", severity: "error", path: REQUIRED_CATALOG, message: "Required activities.csv is missing." });
