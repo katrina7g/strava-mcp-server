@@ -132,4 +132,27 @@ describe("MCP server tool surface", () => {
     expect(aggregate.groups).toEqual([{ period: "Run", averageWatts: null, averageHeartRate: null }]);
     await client.close();
   });
+
+  it("serves catalog-based training analysis with explicit metric limitations", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain,Average Heart Rate,Average Watts,Relative Effort,Training Load,Intensity,Commute\nrun-1,Jan 5 2026 10:00:00 AM,Steady Run,Run,3600,6.2,activities/run-1.gpx,3500,10000,100,150,210,30,40,55,false\nrun-2,Feb 5 2026 10:00:00 AM,Fast Run,Run,3000,6.2,activities/run-2.gpx,2900,11000,100,160,230,45,55,70,false\nride-1,Feb 6 2026 10:00:00 AM,Ride,Ride,7200,12.4,activities/ride-1.fit,7000,20000,300,140,190,60,70,65,false\n");
+    for (const file of ["run-1.gpx", "run-2.gpx", "ride-1.fit"]) await writeFile(join(exportDir, "activities", file), "synthetic");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const sports = JSON.parse(textContent(await client.callTool({ name: "list_sports", arguments: {} })));
+    const summary = JSON.parse(textContent(await client.callTool({ name: "get_sport_summary", arguments: { sport: "Run", groupBy: "month" } })));
+    const comparison = JSON.parse(textContent(await client.callTool({ name: "compare_training_periods", arguments: { sports: ["Run"], baselineStart: "2026-01-01T00:00:00Z", baselineEnd: "2026-02-01T00:00:00Z", comparisonStart: "2026-02-01T00:00:00Z", comparisonEnd: "2026-03-01T00:00:00Z", metrics: ["distanceMeters", "averagePaceSecondsPerKm"] } })));
+    const bests = JSON.parse(textContent(await client.callTool({ name: "get_personal_bests", arguments: { sport: "Run", metric: "averagePaceSecondsPerKm" } })));
+    const activity = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "run-1", analysisType: "pace" } })));
+    const load = JSON.parse(textContent(await client.callTool({ name: "get_training_load", arguments: { sports: ["Run"], groupBy: "month", preference: "supplied" } })));
+    expect(sports.sports).toEqual(expect.arrayContaining([expect.objectContaining({ sport: "Run", activityCount: 2, activitiesWithTrainingLoad: 2 })]));
+    expect(summary.groups).toHaveLength(2);
+    expect(comparison.metrics.distanceMeters).toMatchObject({ baseline: 10000, comparison: 11000 });
+    expect(bests.results[0]).toMatchObject({ id: "run-2" });
+    expect(activity.analysis.averagePaceSecondsPerKm).toBe(350);
+    expect(activity.limitations[0]).toBe("Catalog-only analysis");
+    expect(load).toMatchObject({ source: "supplied catalog Training Load", groups: [expect.objectContaining({ trainingLoad: 40 }), expect.objectContaining({ trainingLoad: 55 })] });
+    await client.close();
+  });
 });

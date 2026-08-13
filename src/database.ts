@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 5;
+const LATEST_SCHEMA_VERSION = 6;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -54,6 +54,7 @@ function migrate(database: Database): void {
     if (currentVersion < 3) migrationThree(database);
     if (currentVersion < 4) migrationFour(database);
     if (currentVersion < 5) migrationFive(database);
+    if (currentVersion < 6) migrationSix(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -220,6 +221,14 @@ function migrationFive(database: Database): void {
       missing_count INTEGER NOT NULL,
       invalid_count INTEGER NOT NULL
     );
+  `);
+}
+
+function migrationSix(database: Database): void {
+  database.exec(`
+    ALTER TABLE activities ADD COLUMN training_load REAL;
+    ALTER TABLE activities ADD COLUMN intensity REAL;
+    CREATE INDEX activities_training_load ON activities(observation_status, training_load);
   `);
 }
 

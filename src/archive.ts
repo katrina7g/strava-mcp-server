@@ -36,6 +36,8 @@ const ACTIVITY_FIELDS = [
   { name: "averageHeartRate", type: "number", unit: "bpm", privacy: "private" },
   { name: "averageWatts", type: "number", unit: "watts", privacy: "private" },
   { name: "relativeEffort", type: "number", unit: null, privacy: "private" },
+  { name: "trainingLoad", type: "number", unit: "source-defined", privacy: "private" },
+  { name: "intensity", type: "number", unit: "source-defined", privacy: "private" },
   { name: "commute", type: "boolean", unit: null, privacy: "private" },
 ] as const;
 

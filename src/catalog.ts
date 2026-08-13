@@ -5,7 +5,7 @@ import { extname } from "node:path";
 import type { Database } from "./database.js";
 import { parseCsv } from "./validator.js";
 
-export const ACTIVITY_CATALOG_COLUMN_MAP_VERSION = 1;
+export const ACTIVITY_CATALOG_COLUMN_MAP_VERSION = 2;
 
 export type ColumnType = "string" | "number" | "integer" | "boolean" | "date";
 export type ColumnDefinition = Readonly<{
@@ -35,6 +35,8 @@ export const ACTIVITY_CATALOG_COLUMNS_V1: readonly ColumnDefinition[] = [
   { field: "averageHeartRate", sourceHeader: "Average Heart Rate", occurrence: 1, type: "number" },
   { field: "averageWatts", sourceHeader: "Average Watts", occurrence: 1, type: "number" },
   { field: "relativeEffort", sourceHeader: "Relative Effort", occurrence: 1, type: "number" },
+  { field: "trainingLoad", sourceHeader: "Training Load", occurrence: 1, type: "number" },
+  { field: "intensity", sourceHeader: "Intensity", occurrence: 1, type: "number" },
   { field: "commute", sourceHeader: "Commute", occurrence: 1, type: "boolean" },
 ];
 
@@ -195,13 +197,13 @@ export async function importActivityCatalog(
       INSERT INTO activity_catalog_rows (snapshot_id, activity_id, row_number, row_hash, column_map_version, raw_values_json, parsed_values_json, parse_status, parse_error_summary, observed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const existing = database.prepare("SELECT catalog_row_hash FROM activities WHERE id = ?");
+    const existing = database.prepare("SELECT catalog_row_hash, catalog_map_version FROM activities WHERE id = ?");
     const insertActivity = database.prepare(`
-      INSERT INTO activities (id, catalog_filename, sport_type, started_at, duration_seconds, distance_meters, available, catalog_row_hash, catalog_map_version, first_seen_snapshot_id, last_seen_snapshot_id, last_observed_at, observation_status, name, description, moving_seconds, distance_miles, elevation_gain_meters, average_heart_rate, average_watts, relative_effort, commute)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'observed', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO activities (id, catalog_filename, sport_type, started_at, duration_seconds, distance_meters, available, catalog_row_hash, catalog_map_version, first_seen_snapshot_id, last_seen_snapshot_id, last_observed_at, observation_status, name, description, moving_seconds, distance_miles, elevation_gain_meters, average_heart_rate, average_watts, relative_effort, training_load, intensity, commute)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const updateActivity = database.prepare(`
-      UPDATE activities SET catalog_filename = ?, sport_type = ?, started_at = ?, duration_seconds = ?, distance_meters = ?, available = 1, catalog_row_hash = ?, catalog_map_version = ?, last_seen_snapshot_id = ?, last_observed_at = ?, observation_status = 'observed', name = ?, description = ?, moving_seconds = ?, distance_miles = ?, elevation_gain_meters = ?, average_heart_rate = ?, average_watts = ?, relative_effort = ?, commute = ?
+      UPDATE activities SET catalog_filename = ?, sport_type = ?, started_at = ?, duration_seconds = ?, distance_meters = ?, available = 1, catalog_row_hash = ?, catalog_map_version = ?, last_seen_snapshot_id = ?, last_observed_at = ?, observation_status = 'observed', name = ?, description = ?, moving_seconds = ?, distance_miles = ?, elevation_gain_meters = ?, average_heart_rate = ?, average_watts = ?, relative_effort = ?, training_load = ?, intensity = ?, commute = ?
       WHERE id = ?
     `);
     const observeUnchanged = database.prepare("UPDATE activities SET last_seen_snapshot_id = ?, last_observed_at = ?, observation_status = 'observed' WHERE id = ?");
@@ -221,15 +223,15 @@ export async function importActivityCatalog(
       if (activityId === null || status === "invalid" || duplicate) { invalid += 1; continue; }
       observedIds.add(activityId);
 
-      const prior = existing.get(activityId) as { catalog_row_hash: string | null } | undefined;
+      const prior = existing.get(activityId) as { catalog_row_hash: string | null; catalog_map_version: number | null } | undefined;
       if (prior === undefined) {
-        insertActivity.run(activityId, value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, snapshotId, now, value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0);
+        insertActivity.run(activityId, value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), 1, row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, snapshotId, now, "observed", value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<number>(row, "trainingLoad"), value<number>(row, "intensity"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0);
         inserted += 1;
-      } else if (prior.catalog_row_hash === row.rowHash) {
+      } else if (prior.catalog_row_hash === row.rowHash && prior.catalog_map_version === ACTIVITY_CATALOG_COLUMN_MAP_VERSION) {
         observeUnchanged.run(snapshotId, now, activityId);
         unchanged += 1;
       } else {
-        updateActivity.run(value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, now, value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0, activityId);
+        updateActivity.run(value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, now, value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<number>(row, "trainingLoad"), value<number>(row, "intensity"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0, activityId);
         changed += 1;
       }
       const catalogFilename = value<string>(row, "catalogFilename");

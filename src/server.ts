@@ -6,6 +6,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { aggregateTraining, getArchiveSummary, getDataSchema, searchActivities } from "./archive.js";
 import { importActivityCatalog } from "./catalog.js";
 import { closeDatabase, openDatabase } from "./database.js";
+import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
 
 const SERVER_NAME = "strava-mcp-server";
@@ -15,6 +16,10 @@ const MAX_PAGE_SIZE = 100;
 
 const optionalDate = z.string().datetime().optional();
 const optionalFiniteNumber = z.number().finite().optional();
+const trainingMetrics = z.enum(["activityCount", "distanceMeters", "durationSeconds", "elevationGainMeters", "averagePaceSecondsPerKm", "averageHeartRate", "averageWatts", "relativeEffort"]);
+const trainingFilterSchema = z.object({
+  sports: z.array(z.string().trim().min(1)).max(20).optional(), startDate: optionalDate, endDate: optionalDate,
+}).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." });
 
 function configuredExport(config: ServerConfig): { exportDir: string } | { error: true; result: { isError: true; content: [{ type: "text"; text: string }] } } {
   if (config.exportDir !== undefined) return { exportDir: config.exportDir };
@@ -50,6 +55,66 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         },
       ],
     }),
+  );
+
+  server.registerTool(
+    "list_sports",
+    { title: "List sports", description: "Lists sports present in the imported catalog with coverage and metric availability.", inputSchema: trainingFilterSchema },
+    async (input) => withDatabase(config, (database) => listSports(database, input)),
+  );
+
+  server.registerTool(
+    "get_sport_summary",
+    {
+      title: "Get sport summary", description: "Summarizes one sport over time using imported catalog metrics.",
+      inputSchema: trainingFilterSchema.extend({ sport: z.string().trim().min(1), groupBy: z.enum(["week", "month", "year"]).optional() }),
+    },
+    async (input) => withDatabase(config, (database) => getSportSummary(database, input)),
+  );
+
+  server.registerTool(
+    "compare_training_periods",
+    {
+      title: "Compare training periods", description: "Compares allowlisted catalog metrics across two date ranges.",
+      inputSchema: z.object({
+        sports: z.array(z.string().trim().min(1)).max(20).optional(),
+        baselineStart: z.string().datetime(), baselineEnd: z.string().datetime(),
+        comparisonStart: z.string().datetime(), comparisonEnd: z.string().datetime(),
+        metrics: z.array(trainingMetrics).min(1).max(8).optional(),
+      }).refine((input) => input.baselineStart < input.baselineEnd && input.comparisonStart < input.comparisonEnd, { message: "Each period start must be before its end." }),
+    },
+    async (input) => withDatabase(config, (database) => compareTrainingPeriods(database, input)),
+  );
+
+  server.registerTool(
+    "get_personal_bests",
+    {
+      title: "Get personal bests", description: "Returns catalog-derived best activities for one sport with documented definitions.",
+      inputSchema: trainingFilterSchema.extend({
+        sport: z.string().trim().min(1), metric: z.enum(["distanceMeters", "averagePaceSecondsPerKm", "elevationGainMeters", "averageWatts"]),
+        minDistanceMeters: optionalFiniteNumber, maxDistanceMeters: optionalFiniteNumber, minDurationSeconds: optionalFiniteNumber,
+        limit: z.number().int().min(1).max(20).optional(),
+      }),
+    },
+    async (input) => withDatabase(config, (database) => getPersonalBests(database, input)),
+  );
+
+  server.registerTool(
+    "analyze_activity",
+    {
+      title: "Analyze activity", description: "Provides catalog-level activity analysis. Splits, routes, and telemetry require detailed-format import.",
+      inputSchema: z.object({ activityId: z.string().trim().min(1), analysisType: z.enum(["catalogSummary", "pace", "intensity"]).default("catalogSummary") }),
+    },
+    async ({ activityId, analysisType }) => withDatabase(config, (database) => analyzeActivity(database, activityId, analysisType)),
+  );
+
+  server.registerTool(
+    "get_training_load",
+    {
+      title: "Get training load", description: "Groups supplied or clearly labelled derived training-load proxies.",
+      inputSchema: trainingFilterSchema.extend({ groupBy: z.enum(["week", "month", "sport"]).optional(), preference: z.enum(["supplied", "relativeEffort", "duration"]).optional() }),
+    },
+    async (input) => withDatabase(config, (database) => getTrainingLoad(database, input)),
   );
 
   server.registerTool(
