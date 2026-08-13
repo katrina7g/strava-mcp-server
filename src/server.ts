@@ -1,10 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { pathToFileURL } from "node:url";
+import { z } from "zod";
 import { loadConfig, type ServerConfig } from "./config.js";
+import { closeDatabase, openDatabase } from "./database.js";
+import { validateExport } from "./validator.js";
 
 const SERVER_NAME = "strava-mcp-server";
 const SERVER_VERSION = "1.0.0";
+const MAX_TOOL_FINDINGS = 50;
 
 /**
  * Creates the server without opening a transport, which keeps the entry point
@@ -35,6 +39,41 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         },
       ],
     }),
+  );
+
+  server.registerTool(
+    "validate_export",
+    {
+      title: "Validate Strava export",
+      description: "Read-only validation of the configured local Strava export. Records a local validation snapshot but never changes the export.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      if (config.exportDir === undefined) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: JSON.stringify({ code: "EXPORT_DIR_NOT_CONFIGURED", message: "Set STRAVA_EXPORT_DIR before validating an export." }) }],
+        };
+      }
+      const database = await openDatabase(config);
+      try {
+        const report = await validateExport(config.exportDir, database);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              outcome: report.outcome,
+              delta: report.summary,
+              findings: report.findings.slice(0, MAX_TOOL_FINDINGS),
+              totalFindings: report.findings.length,
+              findingsTruncated: report.findings.length > MAX_TOOL_FINDINGS,
+            }),
+          }],
+        };
+      } finally {
+        closeDatabase(database);
+      }
+    },
   );
 
   return server;

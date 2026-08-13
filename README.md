@@ -5,7 +5,7 @@ will enable an MCP client to query training data, without connecting to a servic
 
 ## Scope
 
-This repository contains the server foundation: a stdio MCP server, local-path configuration, a build, and tests.
+This repository contains a local, read-only MCP server for a Strava data export. It validates an archive and stores its validation history in a separate local SQLite database; activity import and training queries follow in later phases.
 
 This server is:
 
@@ -69,19 +69,20 @@ Open the Inspector URL printed by the terminal. Add a server with these values:
 | Arguments | `/absolute/path/to/strava-mcp-server/dist/server.js` |
 | Working directory | `/absolute/path/to/strava-mcp-server` |
 
-Connect, open the Tools view, and run `get_server_info` with `{}`. A successful
-result reports `mode: "local-read-only"` and `exportConfigured: true`.
+Connect, open the Tools view, and run `validate_export` with `{}`. It reports a compact file delta and findings. It creates one `strava.sqlite` database under `STRAVA_MCP_DATA_DIR`; rerun the tool after downloading a refreshed export to record another validation snapshot. The source export is never modified.
 
 ## Configuration
 
 | Variable | Required now | Meaning |
 | --- | --- | --- |
-| `STRAVA_EXPORT_DIR` | No | The immutable local source export. It is optional until the import feature is implemented. |
+| `STRAVA_EXPORT_DIR` | Required for validation | The immutable local source export. |
 | `STRAVA_MCP_DATA_DIR` | No | Directory for generated local data. Defaults to `~/.strava-mcp-server`. |
 
 The server rejects a data directory that is the export directory itself or is
 nested inside it (or vice versa). This prevents generated cache files from
 being written into the immutable source export.
+
+Exact coordinates, privacy zones, IP addresses, emails, and device identifiers are sensitive. Validation deliberately reports only paths, counts, formats, and structural issues; it does not expose activity telemetry or account fields.
 
 ## Data and Git hygiene
 Do not commit a real Strava export, generated database, API credential, or
