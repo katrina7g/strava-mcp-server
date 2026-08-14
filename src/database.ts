@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 6;
+const LATEST_SCHEMA_VERSION = 7;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -55,6 +55,7 @@ function migrate(database: Database): void {
     if (currentVersion < 4) migrationFour(database);
     if (currentVersion < 5) migrationFive(database);
     if (currentVersion < 6) migrationSix(database);
+    if (currentVersion < 7) migrationSeven(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -229,6 +230,57 @@ function migrationSix(database: Database): void {
     ALTER TABLE activities ADD COLUMN training_load REAL;
     ALTER TABLE activities ADD COLUMN intensity REAL;
     CREATE INDEX activities_training_load ON activities(observation_status, training_load);
+  `);
+}
+
+function migrationSeven(database: Database): void {
+  database.exec(`
+    CREATE TABLE activity_streams (
+      id INTEGER PRIMARY KEY,
+      activity_id TEXT NOT NULL REFERENCES activities(id),
+      sequence INTEGER NOT NULL,
+      timestamp TEXT,
+      latitude REAL,
+      longitude REAL,
+      altitude_meters REAL,
+      distance_meters REAL,
+      heart_rate REAL,
+      cadence REAL,
+      power_watts REAL,
+      speed_meters_per_second REAL,
+      source_payload_json TEXT,
+      UNIQUE(activity_id, sequence)
+    );
+    CREATE INDEX activity_streams_window ON activity_streams(activity_id, timestamp, distance_meters);
+    CREATE TABLE activity_laps (
+      id INTEGER PRIMARY KEY,
+      activity_id TEXT NOT NULL REFERENCES activities(id),
+      sequence INTEGER NOT NULL,
+      started_at TEXT,
+      duration_seconds REAL,
+      distance_meters REAL,
+      elevation_gain_meters REAL,
+      average_heart_rate REAL,
+      average_cadence REAL,
+      average_power_watts REAL,
+      source_payload_json TEXT,
+      UNIQUE(activity_id, sequence)
+    );
+    CREATE TABLE activity_bounds (
+      activity_id TEXT PRIMARY KEY REFERENCES activities(id),
+      point_count INTEGER NOT NULL,
+      started_at TEXT,
+      ended_at TEXT,
+      min_latitude REAL,
+      min_longitude REAL,
+      max_latitude REAL,
+      max_longitude REAL,
+      total_distance_meters REAL,
+      elevation_gain_meters REAL,
+      has_location INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX activity_files_decode ON activity_files(decode_status);
   `);
 }
 

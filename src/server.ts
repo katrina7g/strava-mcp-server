@@ -6,6 +6,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { aggregateTraining, getArchiveSummary, getDataSchema, searchActivities } from "./archive.js";
 import { importActivityCatalog } from "./catalog.js";
 import { closeDatabase, openDatabase } from "./database.js";
+import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
 
@@ -13,6 +14,8 @@ const SERVER_NAME = "strava-mcp-server";
 const SERVER_VERSION = "1.0.0";
 const MAX_TOOL_FINDINGS = 50;
 const MAX_PAGE_SIZE = 100;
+const MAX_STREAM_POINTS = 1_000;
+const MAX_ROUTE_POINTS = 1_000;
 
 const optionalDate = z.string().datetime().optional();
 const optionalFiniteNumber = z.number().finite().optional();
@@ -55,6 +58,43 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         },
       ],
     }),
+  );
+
+  server.registerTool(
+    "import_detailed_activities",
+    {
+      title: "Import detailed activities",
+      description: "Decodes linked GPX, FIT, compressed FIT, and compressed TCX files into the local database. Source files are never changed; per-file failures do not stop the remaining import.",
+      inputSchema: z.object({ activityId: z.string().trim().min(1).optional() }),
+    },
+    async ({ activityId }) => {
+      const configured = configuredExport(config);
+      if ("error" in configured) return configured.result;
+      const database = await openDatabase(config);
+      try { return { content: [{ type: "text", text: JSON.stringify(await importDetailedActivityFiles(configured.exportDir, database, activityId)) }] }; }
+      finally { closeDatabase(database); }
+    },
+  );
+
+  server.registerTool(
+    "get_activity_stream",
+    {
+      title: "Get activity stream", description: "Returns bounded imported telemetry. Coordinates require explicit fields including latitude and longitude.",
+      inputSchema: z.object({
+        activityId: z.string().trim().min(1), fields: z.array(z.enum(["timestamp", "altitudeMeters", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond", "latitude", "longitude"])).max(9).optional(),
+        maxPoints: z.number().int().min(1).max(MAX_STREAM_POINTS).optional(), startTime: optionalDate, endTime: optionalDate,
+      }).refine((input) => input.startTime === undefined || input.endTime === undefined || input.startTime < input.endTime, { message: "startTime must be before endTime." }),
+    },
+    async ({ activityId, fields, maxPoints, startTime, endTime }) => withDatabase(config, (database) => getActivityStream(database, activityId, fields ?? [], maxPoints ?? 250, startTime, endTime)),
+  );
+
+  server.registerTool(
+    "get_activity_route",
+    {
+      title: "Get activity route", description: "Returns a privacy-preserving route summary by default, or a bounded simplified GeoJSON LineString when includeLocation is explicitly true.",
+      inputSchema: z.object({ activityId: z.string().trim().min(1), includeLocation: z.boolean().default(false), maxPoints: z.number().int().min(2).max(MAX_ROUTE_POINTS).optional() }),
+    },
+    async ({ activityId, includeLocation, maxPoints }) => withDatabase(config, (database) => getActivityRoute(database, activityId, includeLocation, maxPoints ?? 250)),
   );
 
   server.registerTool(
