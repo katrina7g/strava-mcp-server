@@ -35,8 +35,10 @@
   },
   "homepage": "https://github.com/katrina7g/strava-mcp-server#readme",
   "dependencies": {
+    "@garmin/fitsdk": "^21.213.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^11.10.0",
+    "saxes": "^6.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

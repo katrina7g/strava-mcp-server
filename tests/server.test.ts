@@ -1,4 +1,5 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { gzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -153,6 +154,39 @@ describe("MCP server tool surface", () => {
     expect(activity.analysis.averagePaceSecondsPerKm).toBe(350);
     expect(activity.limitations[0]).toBe("Catalog-only analysis");
     expect(load).toMatchObject({ source: "supplied catalog Training Load", groups: [expect.objectContaining({ trainingLoad: 40 }), expect.objectContaining({ trainingLoad: 55 })] });
+    await client.close();
+  });
+
+  it("imports a detailed GPX file and keeps route coordinates opt-in", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time><extensions><gpxtpx:hr xmlns:gpxtpx=\"x\">140</gpxtpx:hr></extensions></trkpt><trkpt lat=\"37.2\" lon=\"-122.2\"><ele>15</ele><time>2026-01-01T18:01:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const imported = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: { activityId: "gpx-1" } })));
+    const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1", fields: ["timestamp", "altitudeMeters", "heartRate"] } })));
+    const privateRoute = JSON.parse(textContent(await client.callTool({ name: "get_activity_route", arguments: { activityId: "gpx-1" } })));
+    const route = JSON.parse(textContent(await client.callTool({ name: "get_activity_route", arguments: { activityId: "gpx-1", includeLocation: true } })));
+    expect(imported).toMatchObject({ decoded: 1, failed: 0 });
+    expect(stream.points).toHaveLength(2);
+    expect(stream.points[0]).toMatchObject({ altitudeMeters: 10, heartRate: 140 });
+    expect(privateRoute).toMatchObject({ includeLocation: false });
+    expect(JSON.stringify(privateRoute)).not.toContain("-122.1");
+    expect(route.geometry).toMatchObject({ type: "LineString", coordinates: [[-122.1, 37.1], [-122.2, 37.2]] });
+    await client.close();
+  });
+
+  it("imports whitespace-prefixed compressed TCX with laps", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ntcx-1,Jan 1 2026 10:00:00 AM,TCX Run,Run,120,0.1,activities/tcx-1.tcx.gz,110,100,5\n");
+    const tcx = " \n<?xml version=\"1.0\"?><TrainingCenterDatabase><Activities><Activity><Lap StartTime=\"2026-01-01T18:00:00Z\"><TotalTimeSeconds>60</TotalTimeSeconds><DistanceMeters>100</DistanceMeters><Track><Trackpoint><Time>2026-01-01T18:00:00Z</Time><Position><LatitudeDegrees>37.1</LatitudeDegrees><LongitudeDegrees>-122.1</LongitudeDegrees></Position><AltitudeMeters>10</AltitudeMeters><DistanceMeters>0</DistanceMeters><HeartRateBpm><Value>130</Value></HeartRateBpm><Cadence>80</Cadence></Trackpoint></Track></Lap></Activity></Activities></TrainingCenterDatabase>";
+    await writeFile(join(exportDir, "activities", "tcx-1.tcx.gz"), gzipSync(tcx));
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const imported = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: { activityId: "tcx-1" } })));
+    expect(imported.results[0]).toMatchObject({ status: "decoded", pointCount: 1, lapCount: 1 });
     await client.close();
   });
 });
