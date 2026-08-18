@@ -7,6 +7,7 @@ import { aggregateTraining, getActivity, getArchiveSummary, getDataSchema, searc
 import { importActivityCatalog } from "./catalog.js";
 import { closeDatabase, openDatabase } from "./database.js";
 import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
+import { getGear, importGear } from "./gear.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
 
@@ -212,6 +213,37 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
   );
 
   server.registerTool(
+    "import_supporting_data",
+    {
+      title: "Import supporting data",
+      description: "Imports the export's supporting domains, currently gear, into the local database. Reuses the latest validation snapshot and never changes the source export.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const configured = configuredExport(config);
+      if ("error" in configured) return configured.result;
+      const database = await openDatabase(config);
+      try {
+        const snapshotId = await latestSnapshotId(configured.exportDir, database);
+        return { content: [{ type: "text", text: JSON.stringify({ snapshotId, domains: await importGear(configured.exportDir, database, snapshotId) }) }] };
+      } finally { closeDatabase(database); }
+    },
+  );
+
+  server.registerTool(
+    "get_gear",
+    {
+      title: "Get gear",
+      description: "Lists imported gear with usage counts and distance. Returns an empty, explained result when an export contains no gear.",
+      inputSchema: z.object({
+        gearType: z.enum(["shoe", "bike", "component"]).optional(),
+        page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+      }),
+    },
+    async (input) => withDatabase(config, (database) => getGear(database, input)),
+  );
+
+  server.registerTool(
     "get_archive_summary",
     { title: "Get archive summary", description: "Summarizes imported activity coverage and latest validation health." },
     async () => withDatabase(config, (database) => getArchiveSummary(database)),
@@ -219,7 +251,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
 
   server.registerTool(
     "get_data_schema",
-    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog"]).optional() }) },
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear"]).optional() }) },
     async ({ domain }) => withDatabase(config, (database) => getDataSchema(database, domain)),
   );
 
@@ -318,6 +350,15 @@ function registerResources(server: McpServer, config: ServerConfig): void {
 async function readThroughDatabase<T>(config: ServerConfig, action: (database: Awaited<ReturnType<typeof openDatabase>>) => T): Promise<T> {
   const database = await openDatabase(config);
   try { return action(database); } finally { closeDatabase(database); }
+}
+
+/** Supporting import reuses the most recent completed snapshot so validating
+ * and importing in sequence records one snapshot rather than two. */
+async function latestSnapshotId(exportDir: string, database: Awaited<ReturnType<typeof openDatabase>>): Promise<number> {
+  const existing = database.prepare("SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1").get() as { id: number } | undefined;
+  if (existing !== undefined) return existing.id;
+  await validateExport(exportDir, database);
+  return (database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number }).id;
 }
 
 async function withDatabase(config: ServerConfig, action: (database: ReturnType<typeof openDatabase> extends Promise<infer T> ? T : never) => object): Promise<{ content: [{ type: "text"; text: string }] }> {

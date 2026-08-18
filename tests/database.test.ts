@@ -29,7 +29,7 @@ describe("Database initialization", () => {
     const snapshots = second.prepare("SELECT count(*) AS count FROM export_snapshots").get() as { count: number };
     closeDatabase(second);
 
-    expect(version.version).toBe(8);
+    expect(version.version).toBe(9);
     expect(snapshots.count).toBe(1);
   });
 

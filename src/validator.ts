@@ -124,7 +124,9 @@ export async function validateExport(exportDir: string, database: Database): Pro
       availability[path] = directoryEntries.length === 0 ? "available-but-empty" : "available";
     } catch { availability[path] = "unavailable"; }
   }
-  for (const path of ["activities.csv", "media.csv", "messaging.json"]) {
+  // Supporting sources are reported so a client can tell a genuinely empty
+  // domain from a missing file, whether or not a tool imports it yet.
+  for (const path of ["activities.csv", "media.csv", "messaging.json", "shoes.csv", "bikes.csv", "components.csv", "global_challenges.csv", "group_challenges.csv", "clubs.csv", "memberships.csv"]) {
     const source = allFiles.includes(path);
     try {
       if (!source) {

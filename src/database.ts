@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 8;
+const LATEST_SCHEMA_VERSION = 9;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -57,6 +57,7 @@ function migrate(database: Database): void {
     if (currentVersion < 6) migrationSix(database);
     if (currentVersion < 7) migrationSeven(database);
     if (currentVersion < 8) migrationEight(database);
+    if (currentVersion < 9) migrationNine(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -296,6 +297,48 @@ function migrationEight(database: Database): void {
     ALTER TABLE activities ADD COLUMN offset_source TEXT;
     CREATE INDEX activities_local_time
       ON activities(observation_status, sport_type, started_at_local);
+  `);
+}
+
+/** Supporting domains keep current state only: a row hash plus observation
+ * columns give the same delta reporting as the catalog without a per-snapshot
+ * raw-row table, which earns its cost on the 103-column catalog and not here.
+ * Gear identity is a normalized name because the export has no gear ID. */
+function migrationNine(database: Database): void {
+  database.exec(`
+    CREATE TABLE gear (
+      id TEXT PRIMARY KEY,
+      gear_type TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      match_key TEXT NOT NULL,
+      brand TEXT,
+      model TEXT,
+      default_sport_types TEXT,
+      source TEXT NOT NULL,
+      row_hash TEXT,
+      first_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      observation_status TEXT NOT NULL DEFAULT 'observed'
+    );
+    CREATE INDEX gear_match ON gear(match_key);
+
+    ALTER TABLE activities ADD COLUMN gear_name TEXT;
+    ALTER TABLE activities ADD COLUMN gear_match_key TEXT;
+    CREATE INDEX activities_gear ON activities(observation_status, gear_match_key);
+
+    CREATE TABLE supporting_imports (
+      snapshot_id INTEGER NOT NULL REFERENCES export_snapshots(id),
+      domain TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      availability TEXT NOT NULL,
+      imported_at TEXT NOT NULL,
+      inserted_count INTEGER NOT NULL,
+      changed_count INTEGER NOT NULL,
+      unchanged_count INTEGER NOT NULL,
+      missing_count INTEGER NOT NULL,
+      invalid_count INTEGER NOT NULL,
+      PRIMARY KEY (snapshot_id, source_path)
+    );
   `);
 }
 

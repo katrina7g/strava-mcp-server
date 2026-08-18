@@ -44,6 +44,30 @@ const ACTIVITY_FIELDS = [
   { name: "commute", type: "boolean", unit: null, privacy: "private" },
 ] as const;
 
+const GEAR_FIELDS = [
+  { name: "name", type: "string", unit: null, privacy: "private" },
+  { name: "gearType", type: "string", unit: null, privacy: "private" },
+  { name: "brand", type: "string", unit: null, privacy: "private" },
+  { name: "model", type: "string", unit: null, privacy: "private" },
+  { name: "activityCount", type: "number", unit: "activities", privacy: "private" },
+  { name: "distanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "source", type: "string", unit: null, privacy: "private" },
+] as const;
+
+/**
+ * Sources present in an export that this server deliberately does not parse
+ * into a queryable table. Naming them keeps a client from inferring that a
+ * domain is absent from the export when it is merely not imported.
+ */
+const NOT_IMPORTED_DOMAINS = [
+  { domain: "media", reason: "No query tool is implemented yet; references are validated but not imported." },
+  { domain: "challenges", reason: "No query tool is implemented yet." },
+  { domain: "clubs", reason: "No query tool is implemented yet." },
+  { domain: "social", reason: "No query tool is implemented yet. Reactions in an export are those the account gave, never those its activities received." },
+  { domain: "profile-and-account", reason: "Profile, login, device, privacy-zone, preference, connected-app, contact, block, and flag sources are checksummed for change detection and never parsed." },
+  { domain: "messaging", reason: "messaging.json is checksummed and never parsed." },
+] as const;
+
 function filters(input: Pick<ActivitySearchInput, "sports" | "startDate" | "endDate" | "minDistanceMeters" | "maxDistanceMeters" | "minDurationSeconds" | "maxDurationSeconds" | "minRelativeEffort" | "text">): { where: string[]; values: unknown[] } {
   const where = ["observation_status = 'observed'"]; const values: unknown[] = [];
   if (input.sports?.length) { where.push(`sport_type IN (${input.sports.map(() => "?").join(", ")})`); values.push(...input.sports); }
@@ -75,7 +99,26 @@ export function getArchiveSummary(database: Database): object {
   `).all();
   const snapshot = database.prepare("SELECT id, completed_at AS completedAt, outcome FROM export_snapshots ORDER BY id DESC LIMIT 1").get();
   const sources = database.prepare("SELECT source_kind AS sourceKind, COUNT(*) AS files, SUM(CASE WHEN error_summary IS NOT NULL THEN 1 ELSE 0 END) AS errors FROM source_manifest WHERE snapshot_id = (SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1) GROUP BY source_kind ORDER BY source_kind").all();
-  return { overview, sports, latestSnapshot: snapshot ?? null, sources };
+  // A valid export may simply contain no bikes or clubs. Naming those sources
+  // keeps "present but empty" distinguishable from a missing file or a parse
+  // failure, which the same manifest also records.
+  const emptySources = database.prepare(`
+    SELECT relative_path AS source FROM source_manifest
+    WHERE snapshot_id = (SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1)
+      AND is_empty = 1 AND relative_path LIKE '%.csv' ORDER BY relative_path
+  `).all() as { source: string }[];
+  const gear = database.prepare("SELECT COUNT(*) AS imported FROM gear WHERE observation_status = 'observed'").get() as { imported: number };
+  return {
+    overview, sports, latestSnapshot: snapshot ?? null, sources,
+    domains: {
+      imported: [
+        { domain: "activities", records: (overview as { activityCount: number }).activityCount },
+        { domain: "gear", records: gear.imported },
+      ],
+      availableButEmpty: emptySources.map((entry) => entry.source),
+      notImported: NOT_IMPORTED_DOMAINS,
+    },
+  };
 }
 
 /**
@@ -132,6 +175,8 @@ export function getDataSchema(database: Database, domain?: string): object {
   return {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
+    ...(domain === undefined || domain === "gear" ? { gear: { fields: GEAR_FIELDS, currentState: "gear", queryTool: "get_gear" } } : {}),
+    notImported: NOT_IMPORTED_DOMAINS,
     sourceColumnMap: latestMap === undefined ? null : { mapVersion: latestMap.mapVersion, columns: JSON.parse(latestMap.columns) },
     note: "Direct identifiers and raw source values are not exposed by activity query tools. Exact coordinates are withheld unless a request to get_activity_route or get_activity_stream sets includeLocation to true.",
   };

@@ -36,7 +36,7 @@ describe("activity catalog normalization", () => {
     const map = buildPositionalColumnMap(headers);
     const row = normalizeActivityCatalogRow(headers, ["42", "Jul 8, 2026, 1:05:36 AM", "12.68", "20414.8", "activities/42.fit.gz", "false"], 2);
 
-    expect(ACTIVITY_CATALOG_COLUMN_MAP_VERSION).toBe(3);
+    expect(ACTIVITY_CATALOG_COLUMN_MAP_VERSION).toBe(4);
     expect(map.map((column) => column.internalName)).toEqual(["activity_id", "activity_date", "distance", "distance__2", "filename", "commute"]);
     expect(row.rawValues).toMatchObject({ distance: "12.68", distance__2: "20414.8" });
     expect(row.parsedValues).toMatchObject({ activityId: "42", distanceMiles: 12.68, distanceMeters: 20414.8, catalogFilename: "activities/42.fit.gz", commute: false });
