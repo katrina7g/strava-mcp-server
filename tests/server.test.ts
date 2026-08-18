@@ -249,6 +249,74 @@ describe("MCP server tool surface", () => {
     await client.close();
   });
 
+  it("caps grouped results and discloses the truncation", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    // Twelve activities on distinct days, so day grouping yields twelve groups.
+    const rows = Array.from({ length: 12 }, (_, index) => `${index + 1},Jan ${index + 1} 2026 10:00:00 AM,Run ${index + 1},Run,1800,3,activities/${index + 1}.gpx,1700,4828,10`).join("\n");
+    await writeFile(join(exportDir, "activities.csv"), `Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\n${rows}\n`);
+    for (let index = 1; index <= 12; index += 1) await writeFile(join(exportDir, "activities", `${index}.gpx`), "<gpx />");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+
+    const capped = JSON.parse(textContent(await client.callTool({ name: "aggregate_training", arguments: { groupBy: "day", metrics: ["activityCount"], maxGroups: 5 } })));
+    const whole = JSON.parse(textContent(await client.callTool({ name: "aggregate_training", arguments: { groupBy: "day", metrics: ["activityCount"] } })));
+    const summary = JSON.parse(textContent(await client.callTool({ name: "get_sport_summary", arguments: { sport: "Run", groupBy: "week", maxGroups: 1 } })));
+    const load = JSON.parse(textContent(await client.callTool({ name: "get_training_load", arguments: { groupBy: "week", maxGroups: 1 } })));
+
+    // The cap limits the rows returned but never hides how many exist.
+    expect(capped.groups).toHaveLength(5);
+    expect(capped).toMatchObject({ totalGroups: 12, truncated: true, maxGroups: 5 });
+    expect(whole.groups).toHaveLength(12);
+    expect(whole).toMatchObject({ totalGroups: 12, truncated: false });
+    expect(summary).toMatchObject({ truncated: true });
+    expect(load).toMatchObject({ truncated: true });
+    await client.close();
+  });
+
+  it("rejects a group cap above the hard maximum", async () => {
+    const root = await temporaryDirectory();
+    const { client } = await connectedClient(loadConfig({ STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    // Input validation is enforced by the schema, upstream of the tool body,
+    // so it surfaces as an error result rather than a structured tool failure.
+    const result = await client.callTool({ name: "aggregate_training", arguments: { groupBy: "day", maxGroups: 5000 } });
+
+    expect(result.isError).toBe(true);
+    expect(textContent(result)).toContain("maxGroups");
+    await client.close();
+  });
+
+  it("returns a structured error instead of leaking internals when a tool fails", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    // An export directory that does not exist: the validator must not surface
+    // the filesystem path or the underlying ENOENT text.
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    const result = await client.callTool({ name: "validate_export", arguments: {} });
+    const payload = JSON.parse(textContent(result));
+
+    expect(payload.outcome).toBe("completed-with-errors");
+    expect(payload.findings[0]).toMatchObject({ code: "EXPORT_ROOT_INVALID" });
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain(exportDir);
+    expect(serialized).not.toContain("ENOENT");
+    await client.close();
+  });
+
+  it("reports a database that cannot be opened with a stable code", async () => {
+    const root = await temporaryDirectory();
+    // A data directory path that cannot be created, because a file occupies it.
+    const blocked = join(root, "blocked");
+    await writeFile(blocked, "not a directory");
+    const { client } = await connectedClient(loadConfig({ STRAVA_MCP_DATA_DIR: join(blocked, "cache") }));
+    const result = await client.callTool({ name: "get_archive_summary", arguments: {} });
+    const payload = JSON.parse(textContent(result));
+
+    expect(result.isError).toBe(true);
+    expect(payload.code).toBe("DATABASE_UNAVAILABLE");
+    expect(JSON.stringify(payload)).not.toContain("ENOTDIR");
+    await client.close();
+  });
+
   it("serves the schema, archive-summary, and privacy-policy resources", async () => {
     const root = await temporaryDirectory();
     const { client } = await connectedClient(loadConfig({ STRAVA_MCP_DATA_DIR: join(root, "cache") }));

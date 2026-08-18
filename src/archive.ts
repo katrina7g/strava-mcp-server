@@ -1,5 +1,6 @@
 import type { Database } from "./database.js";
 import { resolveTotalDistance } from "./details.js";
+import { boundedGroups, DEFAULT_MAX_GROUPS } from "./limits.js";
 import { offsetCoverage, TIME_COLUMNS, type TimeBasis } from "./localtime.js";
 
 export type ActivitySearchInput = Readonly<{
@@ -25,6 +26,7 @@ export type AggregateInput = Readonly<{
   groupBy?: "day" | "week" | "month" | "sport" | undefined;
   metrics?: readonly ("activityCount" | "distanceMeters" | "durationSeconds" | "elevationGainMeters" | "averageHeartRate" | "averageWatts" | "relativeEffort")[] | undefined;
   timeBasis?: TimeBasis | undefined;
+  maxGroups?: number | undefined;
 }>;
 
 const ACTIVITY_FIELDS = [
@@ -216,9 +218,10 @@ export function aggregateTraining(database: Database, input: AggregateInput): ob
   const groupBy = input.groupBy ?? "month";
   const requested = input.metrics?.length ? input.metrics : ["activityCount", "distanceMeters", "durationSeconds"] as const;
   const select = requested.map((metric) => `${metricExpressions[metric]} AS ${metric}`).join(", ");
-  const groups = database.prepare(`SELECT ${grouping[groupBy]} AS period, ${select} FROM activities WHERE ${where.join(" AND ")} GROUP BY period ORDER BY period ASC`).all(...values);
+  const bounded = boundedGroups(database, `SELECT ${grouping[groupBy]} AS period, ${select} FROM activities WHERE ${where.join(" AND ")} GROUP BY period ORDER BY period ASC`, values, input.maxGroups ?? DEFAULT_MAX_GROUPS);
   return {
-    groupBy, metrics: requested, groups,
+    groupBy, metrics: requested, groups: bounded.groups,
+    totalGroups: bounded.totalGroups, truncated: bounded.truncated, maxGroups: bounded.maxGroups,
     timeBasis: groupBy === "sport" ? "not-applicable" : timeBasis,
     offsetCoverage: offsetCoverage(database),
     definitions: { timeBasis: "Calendar periods are grouped in local time where an activity's UTC offset is known, and in UTC otherwise. Date-range filters always use the UTC instant." },

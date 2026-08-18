@@ -4,6 +4,7 @@ import { access, realpath, readdir, readFile, stat } from "node:fs/promises";
 import { createGunzip } from "node:zlib";
 import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Database } from "./database.js";
+import { logInternalError } from "./errors.js";
 
 export type Finding = { code: string; severity: "warning" | "error"; path?: string; message: string };
 export type ManifestEntry = { relativePath: string; sourceKind: string; format: string | null; sizeBytes: number | null; sha256: string | null; status: "new" | "changed" | "unchanged" | "read-failed"; recordCount: number | null; isEmpty: boolean; errorSummary: string | null };
@@ -98,11 +99,6 @@ function safelyReferenced(root: string, approvedDirectory: string, reference: st
   if (!reference || isAbsolute(reference) || reference.includes("\\")) return false;
   const candidate = resolve(root, reference);
   return within(resolve(root, approvedDirectory), candidate);
-}
-
-function logInternalError(context: string, error: unknown): void {
-  const detail = error instanceof Error ? error.stack ?? error.message : String(error);
-  console.error(`[validator] ${context}: ${detail}`);
 }
 
 export async function validateExport(exportDir: string, database: Database): Promise<ValidationReport> {

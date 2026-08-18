@@ -1,4 +1,5 @@
 import type { Database } from "./database.js";
+import { boundedGroups, DEFAULT_MAX_GROUPS } from "./limits.js";
 import { offsetCoverage, TIME_COLUMNS, type TimeBasis } from "./localtime.js";
 
 const TIME_BASIS_DEFINITION = "Calendar periods are grouped in local time where an activity's UTC offset is known, and in UTC otherwise. Date-range filters always use the UTC instant.";
@@ -67,14 +68,14 @@ export function listSports(database: Database, filter: TrainingFilter): object {
   };
 }
 
-export function getSportSummary(database: Database, input: TrainingFilter & { sport: string; groupBy?: "week" | "month" | "year" | undefined; timeBasis?: TimeBasis | undefined }): object {
+export function getSportSummary(database: Database, input: TrainingFilter & { sport: string; groupBy?: "week" | "month" | "year" | undefined; timeBasis?: TimeBasis | undefined; maxGroups?: number | undefined }): object {
   const groupBy = input.groupBy ?? "month";
   const timeBasis = input.timeBasis ?? "local";
   const time = TIME_COLUMNS[timeBasis];
   const grouping = { week: `strftime('%Y-%W', ${time})`, month: `strftime('%Y-%m', ${time})`, year: `strftime('%Y', ${time})` } as const;
   const filter: TrainingFilter = { sports: [input.sport], startDate: input.startDate, endDate: input.endDate };
   const { where, values } = whereFor(filter);
-  const groups = database.prepare(`
+  const bounded = boundedGroups(database, `
     SELECT ${grouping[groupBy]} AS period,
       ${METRIC_EXPRESSIONS.activityCount} AS activityCount,
       ${METRIC_EXPRESSIONS.distanceMeters} AS distanceMeters,
@@ -86,9 +87,11 @@ export function getSportSummary(database: Database, input: TrainingFilter & { sp
       ${METRIC_EXPRESSIONS.relativeEffort} AS relativeEffort
     FROM activities WHERE ${where.join(" AND ")}
     GROUP BY period ORDER BY period ASC
-  `).all(...values);
+  `, values, input.maxGroups ?? DEFAULT_MAX_GROUPS);
   return {
-    sport: input.sport, groupBy, groups, timeBasis, offsetCoverage: offsetCoverage(database),
+    sport: input.sport, groupBy, groups: bounded.groups,
+    totalGroups: bounded.totalGroups, truncated: bounded.truncated, maxGroups: bounded.maxGroups,
+    timeBasis, offsetCoverage: offsetCoverage(database),
     metricAvailability: metricAvailability(database, filter),
     definitions: { averagePaceSecondsPerKm: "Total moving time (or elapsed time when moving time is absent) divided by total distance; not a split-based pace.", timeBasis: TIME_BASIS_DEFINITION },
   };
@@ -166,7 +169,7 @@ export function analyzeActivity(database: Database, activityId: string, analysis
   };
 }
 
-export function getTrainingLoad(database: Database, input: TrainingFilter & { groupBy?: "week" | "month" | "sport" | undefined; preference?: "supplied" | "relativeEffort" | "duration" | undefined; timeBasis?: TimeBasis | undefined }): object {
+export function getTrainingLoad(database: Database, input: TrainingFilter & { groupBy?: "week" | "month" | "sport" | undefined; preference?: "supplied" | "relativeEffort" | "duration" | undefined; timeBasis?: TimeBasis | undefined; maxGroups?: number | undefined }): object {
   const groupBy = input.groupBy ?? "week"; const preference = input.preference ?? "supplied";
   const timeBasis = input.timeBasis ?? "local";
   const time = TIME_COLUMNS[timeBasis];
@@ -176,15 +179,16 @@ export function getTrainingLoad(database: Database, input: TrainingFilter & { gr
     ? "training_load"
     : preference === "relativeEffort" ? "relative_effort" : "duration_seconds / 3600.0";
   const source = preference === "supplied" ? "supplied catalog Training Load" : preference === "relativeEffort" ? "supplied catalog Relative Effort" : "derived duration hours";
-  const groups = database.prepare(`
+  const bounded = boundedGroups(database, `
     SELECT ${grouping[groupBy]} AS period, COUNT(*) AS activityCount,
       SUM(${expression} IS NOT NULL) AS activitiesWithPreferredMetric,
       CASE WHEN COUNT(${expression}) = 0 THEN NULL ELSE SUM(${expression}) END AS trainingLoad
     FROM activities WHERE ${where.join(" AND ")}
     GROUP BY period ORDER BY period ASC
-  `).all(...values);
+  `, values, input.maxGroups ?? DEFAULT_MAX_GROUPS);
   return {
-    groupBy, preference, source, groups,
+    groupBy, preference, source, groups: bounded.groups,
+    totalGroups: bounded.totalGroups, truncated: bounded.truncated, maxGroups: bounded.maxGroups,
     timeBasis: groupBy === "sport" ? "not-applicable" : timeBasis,
     offsetCoverage: offsetCoverage(database),
     definition: preference === "duration" ? "Derived as total activity duration in hours; it is a volume proxy, not physiological training load." : "Sum of the selected source-supplied metric; values are not comparable to a standardized training-load model.",

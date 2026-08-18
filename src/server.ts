@@ -5,9 +5,11 @@ import { z } from "zod";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { aggregateTraining, getActivity, getArchiveSummary, getDataSchema, searchActivities } from "./archive.js";
 import { importActivityCatalog } from "./catalog.js";
-import { closeDatabase, openDatabase } from "./database.js";
+import { closeDatabase, openDatabase, type Database } from "./database.js";
+import { guardTool, logInternalError, toolFailure, toolSuccess, type ToolResult } from "./errors.js";
 import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
 import { getGear, importGear } from "./gear.js";
+import { MAX_GROUPS } from "./limits.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
 
@@ -26,11 +28,8 @@ const trainingFilterSchema = z.object({
 }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." });
 /** Calendar buckets follow local time by default; instants filter in UTC. */
 const timeBasis = z.enum(["local", "utc"]).optional();
-
-function configuredExport(config: ServerConfig): { exportDir: string } | { error: true; result: { isError: true; content: [{ type: "text"; text: string }] } } {
-  if (config.exportDir !== undefined) return { exportDir: config.exportDir };
-  return { error: true, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ code: "EXPORT_DIR_NOT_CONFIGURED", message: "Set STRAVA_EXPORT_DIR before accessing an export." }) }] } };
-}
+/** Grouped results are capped so a long history cannot flood a response. */
+const maxGroups = z.number().int().min(1).max(MAX_GROUPS).optional();
 
 /**
  * Creates the server without opening a transport, which keeps the entry point
@@ -70,13 +69,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       description: "Decodes linked GPX, FIT, compressed FIT, and compressed TCX files into the local database. Source files are never changed; per-file failures do not stop the remaining import.",
       inputSchema: z.object({ activityId: z.string().trim().min(1).optional() }),
     },
-    async ({ activityId }) => {
-      const configured = configuredExport(config);
-      if ("error" in configured) return configured.result;
-      const database = await openDatabase(config);
-      try { return { content: [{ type: "text", text: JSON.stringify(await importDetailedActivityFiles(configured.exportDir, database, activityId, config.timeZone)) }] }; }
-      finally { closeDatabase(database); }
-    },
+    async ({ activityId }) => withExport(config, "import_detailed_activities", (exportDir, database) => importDetailedActivityFiles(exportDir, database, activityId, config.timeZone)),
   );
 
   server.registerTool(
@@ -89,7 +82,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         maxPoints: z.number().int().min(1).max(MAX_STREAM_POINTS).optional(), startTime: optionalDate, endTime: optionalDate,
       }).refine((input) => input.startTime === undefined || input.endTime === undefined || input.startTime < input.endTime, { message: "startTime must be before endTime." }),
     },
-    async ({ activityId, fields, includeLocation, maxPoints, startTime, endTime }) => withDatabase(config, (database) => getActivityStream(database, activityId, fields ?? [], includeLocation, maxPoints ?? 250, startTime, endTime)),
+    async ({ activityId, fields, includeLocation, maxPoints, startTime, endTime }) => withDatabase(config, "get_activity_stream", (database) => getActivityStream(database, activityId, fields ?? [], includeLocation, maxPoints ?? 250, startTime, endTime)),
   );
 
   server.registerTool(
@@ -98,22 +91,22 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       title: "Get activity route", description: "Returns a privacy-preserving route summary by default, or a bounded simplified GeoJSON LineString when includeLocation is explicitly true.",
       inputSchema: z.object({ activityId: z.string().trim().min(1), includeLocation: z.boolean().default(false), maxPoints: z.number().int().min(2).max(MAX_ROUTE_POINTS).optional() }),
     },
-    async ({ activityId, includeLocation, maxPoints }) => withDatabase(config, (database) => getActivityRoute(database, activityId, includeLocation, maxPoints ?? 250)),
+    async ({ activityId, includeLocation, maxPoints }) => withDatabase(config, "get_activity_route", (database) => getActivityRoute(database, activityId, includeLocation, maxPoints ?? 250)),
   );
 
   server.registerTool(
     "list_sports",
     { title: "List sports", description: "Lists sports present in the imported catalog with coverage and metric availability.", inputSchema: trainingFilterSchema },
-    async (input) => withDatabase(config, (database) => listSports(database, input)),
+    async (input) => withDatabase(config, "list_sports", (database) => listSports(database, input)),
   );
 
   server.registerTool(
     "get_sport_summary",
     {
       title: "Get sport summary", description: "Summarizes one sport over time using imported catalog metrics.",
-      inputSchema: trainingFilterSchema.extend({ sport: z.string().trim().min(1), groupBy: z.enum(["week", "month", "year"]).optional(), timeBasis }),
+      inputSchema: trainingFilterSchema.extend({ sport: z.string().trim().min(1), groupBy: z.enum(["week", "month", "year"]).optional(), timeBasis, maxGroups }),
     },
-    async (input) => withDatabase(config, (database) => getSportSummary(database, input)),
+    async (input) => withDatabase(config, "get_sport_summary", (database) => getSportSummary(database, input)),
   );
 
   server.registerTool(
@@ -127,7 +120,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         metrics: z.array(trainingMetrics).min(1).max(8).optional(),
       }).refine((input) => input.baselineStart < input.baselineEnd && input.comparisonStart < input.comparisonEnd, { message: "Each period start must be before its end." }),
     },
-    async (input) => withDatabase(config, (database) => compareTrainingPeriods(database, input)),
+    async (input) => withDatabase(config, "compare_training_periods", (database) => compareTrainingPeriods(database, input)),
   );
 
   server.registerTool(
@@ -140,7 +133,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         limit: z.number().int().min(1).max(20).optional(),
       }),
     },
-    async (input) => withDatabase(config, (database) => getPersonalBests(database, input)),
+    async (input) => withDatabase(config, "get_personal_bests", (database) => getPersonalBests(database, input)),
   );
 
   server.registerTool(
@@ -149,16 +142,16 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       title: "Analyze activity", description: "Provides catalog-level activity analysis. Split-based pacing and telemetry progression are not implemented; decoded telemetry is available through get_activity_stream and get_activity_route.",
       inputSchema: z.object({ activityId: z.string().trim().min(1), analysisType: z.enum(["catalogSummary", "pace", "intensity"]).default("catalogSummary") }),
     },
-    async ({ activityId, analysisType }) => withDatabase(config, (database) => analyzeActivity(database, activityId, analysisType)),
+    async ({ activityId, analysisType }) => withDatabase(config, "analyze_activity", (database) => analyzeActivity(database, activityId, analysisType)),
   );
 
   server.registerTool(
     "get_training_load",
     {
       title: "Get training load", description: "Groups supplied or clearly labelled derived training-load proxies.",
-      inputSchema: trainingFilterSchema.extend({ groupBy: z.enum(["week", "month", "sport"]).optional(), preference: z.enum(["supplied", "relativeEffort", "duration"]).optional(), timeBasis }),
+      inputSchema: trainingFilterSchema.extend({ groupBy: z.enum(["week", "month", "sport"]).optional(), preference: z.enum(["supplied", "relativeEffort", "duration"]).optional(), timeBasis, maxGroups }),
     },
-    async (input) => withDatabase(config, (database) => getTrainingLoad(database, input)),
+    async (input) => withDatabase(config, "get_training_load", (database) => getTrainingLoad(database, input)),
   );
 
   server.registerTool(
@@ -168,28 +161,16 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       description: "Read-only validation of the configured local Strava export. Records a local validation snapshot but never changes the export.",
       inputSchema: z.object({}),
     },
-    async () => {
-      const configured = configuredExport(config);
-      if ("error" in configured) return configured.result;
-      const database = await openDatabase(config);
-      try {
-        const report = await validateExport(configured.exportDir, database);
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              outcome: report.outcome,
-              delta: report.summary,
-              findings: report.findings.slice(0, MAX_TOOL_FINDINGS),
-              totalFindings: report.findings.length,
-              findingsTruncated: report.findings.length > MAX_TOOL_FINDINGS,
-            }),
-          }],
-        };
-      } finally {
-        closeDatabase(database);
-      }
-    },
+    async () => withExport(config, "validate_export", async (exportDir, database) => {
+      const report = await validateExport(exportDir, database);
+      return {
+        outcome: report.outcome,
+        delta: report.summary,
+        findings: report.findings.slice(0, MAX_TOOL_FINDINGS),
+        totalFindings: report.findings.length,
+        findingsTruncated: report.findings.length > MAX_TOOL_FINDINGS,
+      };
+    }),
   );
 
   server.registerTool(
@@ -199,17 +180,12 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       description: "Imports the validated activities.csv catalog into the local database. Never changes the source export.",
       inputSchema: z.object({}),
     },
-    async () => {
-      const configured = configuredExport(config);
-      if ("error" in configured) return configured.result;
-      const database = await openDatabase(config);
-      try {
-        const validation = await validateExport(configured.exportDir, database);
-        const snapshot = database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number };
-        const imported = await importActivityCatalog(configured.exportDir, database, snapshot.id, config.timeZone);
-        return { content: [{ type: "text", text: JSON.stringify({ validation: { outcome: validation.outcome, delta: validation.summary }, catalogDelta: imported }) }] };
-      } finally { closeDatabase(database); }
-    },
+    async () => withExport(config, "import_activity_catalog", async (exportDir, database) => {
+      const validation = await validateExport(exportDir, database);
+      const snapshot = database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number };
+      const imported = await importActivityCatalog(exportDir, database, snapshot.id, config.timeZone);
+      return { validation: { outcome: validation.outcome, delta: validation.summary }, catalogDelta: imported };
+    }),
   );
 
   server.registerTool(
@@ -219,15 +195,10 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       description: "Imports the export's supporting domains, currently gear, into the local database. Reuses the latest validation snapshot and never changes the source export.",
       inputSchema: z.object({}),
     },
-    async () => {
-      const configured = configuredExport(config);
-      if ("error" in configured) return configured.result;
-      const database = await openDatabase(config);
-      try {
-        const snapshotId = await latestSnapshotId(configured.exportDir, database);
-        return { content: [{ type: "text", text: JSON.stringify({ snapshotId, domains: await importGear(configured.exportDir, database, snapshotId) }) }] };
-      } finally { closeDatabase(database); }
-    },
+    async () => withExport(config, "import_supporting_data", async (exportDir, database) => {
+      const snapshotId = await latestSnapshotId(exportDir, database);
+      return { snapshotId, domains: await importGear(exportDir, database, snapshotId) };
+    }),
   );
 
   server.registerTool(
@@ -240,19 +211,19 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
       }),
     },
-    async (input) => withDatabase(config, (database) => getGear(database, input)),
+    async (input) => withDatabase(config, "get_gear", (database) => getGear(database, input)),
   );
 
   server.registerTool(
     "get_archive_summary",
     { title: "Get archive summary", description: "Summarizes imported activity coverage and latest validation health." },
-    async () => withDatabase(config, (database) => getArchiveSummary(database)),
+    async () => withDatabase(config, "get_archive_summary", (database) => getArchiveSummary(database)),
   );
 
   server.registerTool(
     "get_data_schema",
     { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear"]).optional() }) },
-    async ({ domain }) => withDatabase(config, (database) => getDataSchema(database, domain)),
+    async ({ domain }) => withDatabase(config, "get_data_schema", (database) => getDataSchema(database, domain)),
   );
 
   server.registerTool(
@@ -262,7 +233,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       description: "Returns one activity's catalog metadata, derived metrics, raw-file decode status, and telemetry availability. Never returns coordinates.",
       inputSchema: z.object({ activityId: z.string().trim().min(1) }),
     },
-    async ({ activityId }) => withDatabase(config, (database) => getActivity(database, activityId)),
+    async ({ activityId }) => withDatabase(config, "get_activity", (database) => getActivity(database, activityId)),
   );
 
   server.registerTool(
@@ -279,7 +250,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
         sortBy: z.enum(["startedAt", "distanceMeters", "durationSeconds"]).optional(), sortDirection: z.enum(["asc", "desc"]).optional(),
       }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." }),
     },
-    async (input) => withDatabase(config, (database) => searchActivities(database, input)),
+    async (input) => withDatabase(config, "search_activities", (database) => searchActivities(database, input)),
   );
 
   server.registerTool(
@@ -288,11 +259,11 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       title: "Aggregate training", description: "Returns allowlisted activity aggregates grouped by day, week, month, or sport.",
       inputSchema: z.object({
         sports: z.array(z.string().trim().min(1)).max(20).optional(), startDate: optionalDate, endDate: optionalDate,
-        groupBy: z.enum(["day", "week", "month", "sport"]).optional(), timeBasis,
+        groupBy: z.enum(["day", "week", "month", "sport"]).optional(), timeBasis, maxGroups,
         metrics: z.array(z.enum(["activityCount", "distanceMeters", "durationSeconds", "elevationGainMeters", "averageHeartRate", "averageWatts", "relativeEffort"])).min(1).max(7).optional(),
       }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." }),
     },
-    async (input) => withDatabase(config, (database) => aggregateTraining(database, input)),
+    async (input) => withDatabase(config, "aggregate_training", (database) => aggregateTraining(database, input)),
   );
 
   registerResources(server, config);
@@ -331,13 +302,13 @@ function registerResources(server: McpServer, config: ServerConfig): void {
   server.registerResource(
     "schema", "strava://schema",
     { title: "Imported data schema", description: "Field names, types, units, privacy classification, and source column mapping.", mimeType: "application/json" },
-    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await readThroughDatabase(config, (database) => getDataSchema(database))) }] }),
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await readThroughDatabase(config, "strava://schema", (database) => getDataSchema(database))) }] }),
   );
 
   server.registerResource(
     "archive-summary", "strava://archive-summary",
     { title: "Archive summary", description: "Current import health, activity coverage, and sport counts.", mimeType: "application/json" },
-    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await readThroughDatabase(config, (database) => getArchiveSummary(database))) }] }),
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await readThroughDatabase(config, "strava://archive-summary", (database) => getArchiveSummary(database))) }] }),
   );
 
   server.registerResource(
@@ -347,9 +318,22 @@ function registerResources(server: McpServer, config: ServerConfig): void {
   );
 }
 
-async function readThroughDatabase<T>(config: ServerConfig, action: (database: Awaited<ReturnType<typeof openDatabase>>) => T): Promise<T> {
-  const database = await openDatabase(config);
-  try { return action(database); } finally { closeDatabase(database); }
+/** Resources cannot carry the tool error envelope, so a failure is raised as a
+ * sanitized error: the cause goes to stderr, never to the client. */
+async function readThroughDatabase<T>(config: ServerConfig, context: string, action: (database: Database) => T): Promise<T> {
+  let database: Database;
+  try {
+    database = await openDatabase(config);
+  } catch (error) {
+    logInternalError(`${context}: open database`, error);
+    throw new Error("The local database could not be opened.");
+  }
+  try { return action(database); }
+  catch (error) {
+    logInternalError(context, error);
+    throw new Error("The resource could not be read.");
+  }
+  finally { closeDatabase(database); }
 }
 
 /** Supporting import reuses the most recent completed snapshot so validating
@@ -361,10 +345,31 @@ async function latestSnapshotId(exportDir: string, database: Awaited<ReturnType<
   return (database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number }).id;
 }
 
-async function withDatabase(config: ServerConfig, action: (database: ReturnType<typeof openDatabase> extends Promise<infer T> ? T : never) => object): Promise<{ content: [{ type: "text"; text: string }] }> {
-  const database = await openDatabase(config);
-  try { return { content: [{ type: "text", text: JSON.stringify(action(database)) }] }; }
-  finally { closeDatabase(database); }
+/**
+ * Opens the store for one call, runs the tool body, and closes it again. Every
+ * failure path resolves to a structured result: an unopenable database is
+ * distinguishable from a failure inside the query, and neither reaches the
+ * client as a thrown protocol error.
+ */
+async function withDatabase(config: ServerConfig, context: string, action: (database: Database) => object | Promise<object>): Promise<ToolResult> {
+  return guardTool(context, async () => {
+    let database: Database;
+    try {
+      database = await openDatabase(config);
+    } catch (error) {
+      logInternalError(`${context}: open database`, error);
+      return toolFailure("DATABASE_UNAVAILABLE", "The local database could not be opened. Check that STRAVA_MCP_DATA_DIR exists and is writable by this user.");
+    }
+    try { return toolSuccess(await action(database)); }
+    finally { closeDatabase(database); }
+  });
+}
+
+/** Tools that read the export need it configured before anything is opened. */
+async function withExport(config: ServerConfig, context: string, action: (exportDir: string, database: Database) => object | Promise<object>): Promise<ToolResult> {
+  const exportDir = config.exportDir;
+  if (exportDir === undefined) return toolFailure("EXPORT_DIR_NOT_CONFIGURED", "Set STRAVA_EXPORT_DIR before accessing an export.");
+  return withDatabase(config, context, (database) => action(exportDir, database));
 }
 
 export async function main(): Promise<void> {
