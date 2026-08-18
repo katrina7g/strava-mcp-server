@@ -36,7 +36,7 @@ describe("activity catalog normalization", () => {
     const map = buildPositionalColumnMap(headers);
     const row = normalizeActivityCatalogRow(headers, ["42", "Jul 8, 2026, 1:05:36 AM", "12.68", "20414.8", "activities/42.fit.gz", "false"], 2);
 
-    expect(ACTIVITY_CATALOG_COLUMN_MAP_VERSION).toBe(2);
+    expect(ACTIVITY_CATALOG_COLUMN_MAP_VERSION).toBe(3);
     expect(map.map((column) => column.internalName)).toEqual(["activity_id", "activity_date", "distance", "distance__2", "filename", "commute"]);
     expect(row.rawValues).toMatchObject({ distance: "12.68", distance__2: "20414.8" });
     expect(row.parsedValues).toMatchObject({ activityId: "42", distanceMiles: 12.68, distanceMeters: 20414.8, catalogFilename: "activities/42.fit.gz", commute: false });
@@ -49,6 +49,28 @@ describe("activity catalog normalization", () => {
     expect(row.rawValues).toMatchObject({ activity_id: "", activity_date: "not a date", distance: "x", commute: "perhaps" });
     expect(row.parsedValues.activityId).toBeNull();
     expect(row.issues.map((issue) => issue.code)).toEqual(expect.arrayContaining(["CATALOG_REQUIRED_FIELD_MISSING", "CATALOG_VALUE_INVALID"]));
+  });
+
+  it("reads catalog timestamps as UTC regardless of the importing host's zone", () => {
+    const startedAt = (value: string) => normalizeActivityCatalogRow(headers, ["42", value, "1", "1609.34", "", "false"], 2).parsedValues.startedAt;
+
+    // The reference export links this catalog value to a GPX `2026-03-27T01:28:59Z`.
+    expect(startedAt("Mar 27, 2026, 1:28:59 AM")).toBe("2026-03-27T01:28:59.000Z");
+    expect(startedAt("Jan 1 2026 10:00:00 AM")).toBe("2026-01-01T10:00:00.000Z");
+    expect(startedAt("Jul 8, 2026, 12:00:00 AM")).toBe("2026-07-08T00:00:00.000Z");
+    expect(startedAt("Jul 8, 2026, 12:30:00 PM")).toBe("2026-07-08T12:30:00.000Z");
+  });
+
+  it("accepts a zoned ISO-8601 timestamp but rejects impossible or zone-less values", () => {
+    const startedAt = (value: string) => normalizeActivityCatalogRow(headers, ["42", value, "1", "1609.34", "", "false"], 2).parsedValues.startedAt;
+
+    expect(startedAt("2026-03-27T01:28:59Z")).toBe("2026-03-27T01:28:59.000Z");
+    expect(startedAt("2026-03-27T01:28:59-07:00")).toBe("2026-03-27T08:28:59.000Z");
+    // Without a zone the instant is ambiguous, so it is not guessed.
+    expect(startedAt("2026-03-27T01:28:59")).toBeNull();
+    expect(startedAt("Feb 30, 2026, 1:00:00 AM")).toBeNull();
+    expect(startedAt("Mar 27, 2026, 13:00:00 PM")).toBeNull();
+    expect(startedAt("Mar 27, 2026, 1:99:00 AM")).toBeNull();
   });
 
   it("uses a stable hash that changes with any positional source value", () => {

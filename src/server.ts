@@ -23,6 +23,8 @@ const trainingMetrics = z.enum(["activityCount", "distanceMeters", "durationSeco
 const trainingFilterSchema = z.object({
   sports: z.array(z.string().trim().min(1)).max(20).optional(), startDate: optionalDate, endDate: optionalDate,
 }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." });
+/** Calendar buckets follow local time by default; instants filter in UTC. */
+const timeBasis = z.enum(["local", "utc"]).optional();
 
 function configuredExport(config: ServerConfig): { exportDir: string } | { error: true; result: { isError: true; content: [{ type: "text"; text: string }] } } {
   if (config.exportDir !== undefined) return { exportDir: config.exportDir };
@@ -71,7 +73,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       const configured = configuredExport(config);
       if ("error" in configured) return configured.result;
       const database = await openDatabase(config);
-      try { return { content: [{ type: "text", text: JSON.stringify(await importDetailedActivityFiles(configured.exportDir, database, activityId)) }] }; }
+      try { return { content: [{ type: "text", text: JSON.stringify(await importDetailedActivityFiles(configured.exportDir, database, activityId, config.timeZone)) }] }; }
       finally { closeDatabase(database); }
     },
   );
@@ -107,7 +109,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "get_sport_summary",
     {
       title: "Get sport summary", description: "Summarizes one sport over time using imported catalog metrics.",
-      inputSchema: trainingFilterSchema.extend({ sport: z.string().trim().min(1), groupBy: z.enum(["week", "month", "year"]).optional() }),
+      inputSchema: trainingFilterSchema.extend({ sport: z.string().trim().min(1), groupBy: z.enum(["week", "month", "year"]).optional(), timeBasis }),
     },
     async (input) => withDatabase(config, (database) => getSportSummary(database, input)),
   );
@@ -152,7 +154,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "get_training_load",
     {
       title: "Get training load", description: "Groups supplied or clearly labelled derived training-load proxies.",
-      inputSchema: trainingFilterSchema.extend({ groupBy: z.enum(["week", "month", "sport"]).optional(), preference: z.enum(["supplied", "relativeEffort", "duration"]).optional() }),
+      inputSchema: trainingFilterSchema.extend({ groupBy: z.enum(["week", "month", "sport"]).optional(), preference: z.enum(["supplied", "relativeEffort", "duration"]).optional(), timeBasis }),
     },
     async (input) => withDatabase(config, (database) => getTrainingLoad(database, input)),
   );
@@ -202,7 +204,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       try {
         const validation = await validateExport(configured.exportDir, database);
         const snapshot = database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number };
-        const imported = await importActivityCatalog(configured.exportDir, database, snapshot.id);
+        const imported = await importActivityCatalog(configured.exportDir, database, snapshot.id, config.timeZone);
         return { content: [{ type: "text", text: JSON.stringify({ validation: { outcome: validation.outcome, delta: validation.summary }, catalogDelta: imported }) }] };
       } finally { closeDatabase(database); }
     },
@@ -243,7 +245,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
       title: "Aggregate training", description: "Returns allowlisted activity aggregates grouped by day, week, month, or sport.",
       inputSchema: z.object({
         sports: z.array(z.string().trim().min(1)).max(20).optional(), startDate: optionalDate, endDate: optionalDate,
-        groupBy: z.enum(["day", "week", "month", "sport"]).optional(),
+        groupBy: z.enum(["day", "week", "month", "sport"]).optional(), timeBasis,
         metrics: z.array(z.enum(["activityCount", "distanceMeters", "durationSeconds", "elevationGainMeters", "averageHeartRate", "averageWatts", "relativeEffort"])).min(1).max(7).optional(),
       }).refine((input) => input.startDate === undefined || input.endDate === undefined || input.startDate < input.endDate, { message: "startDate must be before endDate." }),
     },

@@ -1,4 +1,7 @@
 import type { Database } from "./database.js";
+import { offsetCoverage, TIME_COLUMNS, type TimeBasis } from "./localtime.js";
+
+const TIME_BASIS_DEFINITION = "Calendar periods are grouped in local time where an activity's UTC offset is known, and in UTC otherwise. Date-range filters always use the UTC instant.";
 
 export type TrainingFilter = Readonly<{
   sports?: readonly string[] | undefined;
@@ -63,9 +66,11 @@ export function listSports(database: Database, filter: TrainingFilter): object {
   };
 }
 
-export function getSportSummary(database: Database, input: TrainingFilter & { sport: string; groupBy?: "week" | "month" | "year" | undefined }): object {
+export function getSportSummary(database: Database, input: TrainingFilter & { sport: string; groupBy?: "week" | "month" | "year" | undefined; timeBasis?: TimeBasis | undefined }): object {
   const groupBy = input.groupBy ?? "month";
-  const grouping = { week: "strftime('%Y-%W', started_at)", month: "strftime('%Y-%m', started_at)", year: "strftime('%Y', started_at)" } as const;
+  const timeBasis = input.timeBasis ?? "local";
+  const time = TIME_COLUMNS[timeBasis];
+  const grouping = { week: `strftime('%Y-%W', ${time})`, month: `strftime('%Y-%m', ${time})`, year: `strftime('%Y', ${time})` } as const;
   const filter: TrainingFilter = { sports: [input.sport], startDate: input.startDate, endDate: input.endDate };
   const { where, values } = whereFor(filter);
   const groups = database.prepare(`
@@ -81,7 +86,11 @@ export function getSportSummary(database: Database, input: TrainingFilter & { sp
     FROM activities WHERE ${where.join(" AND ")}
     GROUP BY period ORDER BY period ASC
   `).all(...values);
-  return { sport: input.sport, groupBy, groups, metricAvailability: metricAvailability(database, filter), definitions: { averagePaceSecondsPerKm: "Total moving time (or elapsed time when moving time is absent) divided by total distance; not a split-based pace." } };
+  return {
+    sport: input.sport, groupBy, groups, timeBasis, offsetCoverage: offsetCoverage(database),
+    metricAvailability: metricAvailability(database, filter),
+    definitions: { averagePaceSecondsPerKm: "Total moving time (or elapsed time when moving time is absent) divided by total distance; not a split-based pace.", timeBasis: TIME_BASIS_DEFINITION },
+  };
 }
 
 export function compareTrainingPeriods(database: Database, input: TrainingFilter & { baselineStart: string; baselineEnd: string; comparisonStart: string; comparisonEnd: string; metrics?: readonly TrainingMetric[] | undefined }): object {
@@ -150,9 +159,11 @@ export function analyzeActivity(database: Database, activityId: string, analysis
   return { found: true, activity: { id: activity.id, name: activity.name, sportType: activity.sportType, startedAt: activity.startedAt }, analysisType, analysis, limitations: ["Catalog-only analysis", "No splits, pauses, route, or telemetry progression until detailed activity formats are imported."] };
 }
 
-export function getTrainingLoad(database: Database, input: TrainingFilter & { groupBy?: "week" | "month" | "sport" | undefined; preference?: "supplied" | "relativeEffort" | "duration" | undefined }): object {
+export function getTrainingLoad(database: Database, input: TrainingFilter & { groupBy?: "week" | "month" | "sport" | undefined; preference?: "supplied" | "relativeEffort" | "duration" | undefined; timeBasis?: TimeBasis | undefined }): object {
   const groupBy = input.groupBy ?? "week"; const preference = input.preference ?? "supplied";
-  const grouping = { week: "strftime('%Y-%W', started_at)", month: "strftime('%Y-%m', started_at)", sport: "COALESCE(sport_type, 'Unknown')" } as const;
+  const timeBasis = input.timeBasis ?? "local";
+  const time = TIME_COLUMNS[timeBasis];
+  const grouping = { week: `strftime('%Y-%W', ${time})`, month: `strftime('%Y-%m', ${time})`, sport: "COALESCE(sport_type, 'Unknown')" } as const;
   const { where, values } = whereFor(input);
   const expression = preference === "supplied"
     ? "training_load"
@@ -165,5 +176,11 @@ export function getTrainingLoad(database: Database, input: TrainingFilter & { gr
     FROM activities WHERE ${where.join(" AND ")}
     GROUP BY period ORDER BY period ASC
   `).all(...values);
-  return { groupBy, preference, source, groups, definition: preference === "duration" ? "Derived as total activity duration in hours; it is a volume proxy, not physiological training load." : "Sum of the selected source-supplied metric; values are not comparable to a standardized training-load model." };
+  return {
+    groupBy, preference, source, groups,
+    timeBasis: groupBy === "sport" ? "not-applicable" : timeBasis,
+    offsetCoverage: offsetCoverage(database),
+    definition: preference === "duration" ? "Derived as total activity duration in hours; it is a volume proxy, not physiological training load." : "Sum of the selected source-supplied metric; values are not comparable to a standardized training-load model.",
+    definitions: { timeBasis: TIME_BASIS_DEFINITION },
+  };
 }

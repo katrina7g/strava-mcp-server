@@ -3,9 +3,11 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { extname } from "node:path";
 import type { Database } from "./database.js";
+import { resolveActivityLocalTimes, type OffsetCoverage } from "./localtime.js";
 import { parseCsv } from "./validator.js";
 
-export const ACTIVITY_CATALOG_COLUMN_MAP_VERSION = 2;
+/** Version 3 reads `Activity Date` as UTC; bumping it re-imports stored rows. */
+export const ACTIVITY_CATALOG_COLUMN_MAP_VERSION = 3;
 
 export type ColumnType = "string" | "number" | "integer" | "boolean" | "date";
 export type ColumnDefinition = Readonly<{
@@ -67,6 +69,7 @@ export type CatalogImportSummary = Readonly<{
   unchanged: number;
   noLongerObserved: number;
   invalid: number;
+  offsetCoverage: OffsetCoverage;
 }>;
 
 function internalName(header: string, occurrence: number): string {
@@ -107,9 +110,41 @@ function parseBoolean(value: string | undefined): boolean | null {
   return null;
 }
 
+/**
+ * Export timestamps are UTC but carry no zone marker: a catalog value of
+ * `Mar 27, 2026, 1:28:59 AM` is the same instant as its linked GPX
+ * `2026-03-27T01:28:59Z`. A lenient `new Date` resolves that format in the
+ * host's zone, which would make the stored instant depend on where the
+ * importer ran. Commas are optional because not every export writes them.
+ */
+const EXPORT_DATE_PATTERN = /^([A-Z][a-z]{2}) (\d{1,2}),? (\d{4}),? (\d{1,2}):(\d{2}):(\d{2}) (AM|PM)$/;
+/** A future export may switch to ISO-8601; accept it only when it states a zone. */
+const ZONED_ISO_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$/;
+const MONTH_INDEX: Readonly<Record<string, number>> = {
+  Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5,
+  Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
+};
+
+function parseExportDate(match: RegExpExecArray): string | null {
+  const month = MONTH_INDEX[match[1]!];
+  const day = Number(match[2]);
+  const hour12 = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (month === undefined || hour12 < 1 || hour12 > 12 || minute > 59 || second > 59) return null;
+  const hour = (hour12 % 12) + (match[7] === "PM" ? 12 : 0);
+  const instant = new Date(Date.UTC(Number(match[3]), month, day, hour, minute, second));
+  // Date.UTC rolls impossible components over instead of rejecting them, so a
+  // value such as `Feb 30` must be caught by comparing the result back.
+  return instant.getUTCMonth() === month && instant.getUTCDate() === day ? instant.toISOString() : null;
+}
+
 function parseDate(value: string | undefined): string | null {
   const text = nullableText(value);
   if (text === null) return null;
+  const match = EXPORT_DATE_PATTERN.exec(text);
+  if (match !== null) return parseExportDate(match);
+  if (!ZONED_ISO_PATTERN.test(text)) return null;
   const parsed = new Date(text);
   return Number.isNaN(parsed.valueOf()) ? null : parsed.toISOString();
 }
@@ -183,6 +218,7 @@ export async function importActivityCatalog(
   exportDir: string,
   database: Database,
   snapshotId: number,
+  timeZone?: string,
 ): Promise<CatalogImportSummary> {
   const source = await readFile(join(exportDir, "activities.csv"), "utf8");
   const csv = parseCsv(source);
@@ -244,5 +280,8 @@ export async function importActivityCatalog(
     return missing;
   });
   const noLongerObserved = importRows();
-  return Object.freeze({ snapshotId, inserted, changed, unchanged, noLongerObserved, invalid });
+  // Local times derive from the catalog's start time, so they are resolved
+  // again whenever that value is imported or corrected.
+  const offsetCoverage = resolveActivityLocalTimes(database, timeZone);
+  return Object.freeze({ snapshotId, inserted, changed, unchanged, noLongerObserved, invalid, offsetCoverage });
 }

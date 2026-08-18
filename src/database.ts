@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 7;
+const LATEST_SCHEMA_VERSION = 8;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -56,6 +56,7 @@ function migrate(database: Database): void {
     if (currentVersion < 5) migrationFive(database);
     if (currentVersion < 6) migrationSix(database);
     if (currentVersion < 7) migrationSeven(database);
+    if (currentVersion < 8) migrationEight(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -281,6 +282,20 @@ function migrationSeven(database: Database): void {
       updated_at TEXT NOT NULL
     );
     CREATE INDEX activity_files_decode ON activity_files(decode_status);
+  `);
+}
+
+/** Export timestamps are UTC, but training questions are asked in local time.
+ * The per-file offset is a fact about one decoded FIT file; the activity-level
+ * offset is the resolved value, which records which source produced it. */
+function migrationEight(database: Database): void {
+  database.exec(`
+    ALTER TABLE activity_files ADD COLUMN utc_offset_minutes INTEGER;
+    ALTER TABLE activities ADD COLUMN started_at_local TEXT;
+    ALTER TABLE activities ADD COLUMN utc_offset_minutes INTEGER;
+    ALTER TABLE activities ADD COLUMN offset_source TEXT;
+    CREATE INDEX activities_local_time
+      ON activities(observation_status, sport_type, started_at_local);
   `);
 }
 

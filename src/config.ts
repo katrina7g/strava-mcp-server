@@ -6,13 +6,26 @@ import { z } from "zod";
 const environmentSchema = z.object({
   STRAVA_EXPORT_DIR: z.string().trim().min(1).optional(),
   STRAVA_MCP_DATA_DIR: z.string().trim().min(1).optional(),
+  STRAVA_MCP_TIMEZONE: z.string().trim().min(1).optional(),
 });
+
+/** An IANA zone name, validated by the runtime rather than a bundled list. */
+function isSupportedTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export type ServerConfig = Readonly<{
   /** The immutable source export. It is optional until import support is added. */
   exportDir?: string;
   /** The writable, generated local cache. It must never overlap the export. */
   dataDir: string;
+  /** Fallback zone for activities whose source carries no UTC offset. */
+  timeZone?: string;
 }>;
 
 export class ConfigError extends Error {
@@ -78,9 +91,18 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Server
     );
   }
 
-  return exportDir === undefined
-    ? Object.freeze({ dataDir })
-    : Object.freeze({ exportDir, dataDir });
+  const timeZone = parsed.data.STRAVA_MCP_TIMEZONE;
+  if (timeZone !== undefined && !isSupportedTimeZone(timeZone)) {
+    throw new ConfigError(
+      `STRAVA_MCP_TIMEZONE must be an IANA time zone name such as America/Los_Angeles; received "${timeZone}".`,
+    );
+  }
+
+  return Object.freeze({
+    ...(exportDir === undefined ? {} : { exportDir }),
+    dataDir,
+    ...(timeZone === undefined ? {} : { timeZone }),
+  });
 }
 
 /** Creates only the generated cache directory; it never writes to the export. */

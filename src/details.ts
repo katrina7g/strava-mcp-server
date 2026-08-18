@@ -5,6 +5,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { createGunzip } from "node:zlib";
 import { SaxesParser } from "saxes";
 import type { Database } from "./database.js";
+import { fitOffsetMinutes, resolveActivityLocalTimes } from "./localtime.js";
 
 const MAX_COMPRESSED_BYTES = 50 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024;
@@ -12,7 +13,7 @@ const MAX_COMPRESSION_RATIO = 100;
 
 export type StreamPoint = { timestamp: string | null; latitude: number | null; longitude: number | null; altitudeMeters: number | null; distanceMeters: number | null; heartRate: number | null; cadence: number | null; powerWatts: number | null; speedMetersPerSecond: number | null; sourcePayload?: Record<string, unknown> };
 export type Lap = { startedAt: string | null; durationSeconds: number | null; distanceMeters: number | null; elevationGainMeters: number | null; averageHeartRate: number | null; averageCadence: number | null; averagePowerWatts: number | null; sourcePayload?: Record<string, unknown> };
-type DetailedActivity = { format: "gpx" | "fit" | "fit.gz" | "tcx.gz"; points: StreamPoint[]; laps: Lap[] };
+type DetailedActivity = { format: "gpx" | "fit" | "fit.gz" | "tcx.gz"; points: StreamPoint[]; laps: Lap[]; utcOffsetMinutes: number | null };
 
 function inRoot(root: string, candidate: string): boolean {
   const difference = relative(root, candidate);
@@ -69,7 +70,8 @@ async function parseGpx(path: string): Promise<DetailedActivity> {
     (value) => { text += value; },
     (name) => { if (current !== undefined) { const value = text.trim(); if (name === "ele") current.altitudeMeters = asNumber(Number(value)); if (name === "time") current.timestamp = asDate(value); if (name === "hr") current.heartRate = asNumber(Number(value)); if (name === "cad") current.cadence = asNumber(Number(value)); if (name === "power") current.powerWatts = asNumber(Number(value)); if (name === "speed") current.speedMetersPerSecond = asNumber(Number(value)); if (name === "trkpt") { points.push(current); current = undefined; } } element = ""; text = ""; },
   );
-  return { format: "gpx", points, laps: [] };
+  // GPX and TCX carry UTC only; no local offset can be recovered from them.
+  return { format: "gpx", points, laps: [], utcOffsetMinutes: null };
 }
 
 async function parseTcx(path: string): Promise<DetailedActivity> {
@@ -79,7 +81,7 @@ async function parseTcx(path: string): Promise<DetailedActivity> {
     (value) => { text += value; },
     (name) => { const value = text.trim(); if (current !== undefined) { if (name === "Time") current.timestamp = asDate(value); if (name === "LatitudeDegrees") current.latitude = asNumber(Number(value)); if (name === "LongitudeDegrees") current.longitude = asNumber(Number(value)); if (name === "AltitudeMeters") current.altitudeMeters = asNumber(Number(value)); if (name === "DistanceMeters") current.distanceMeters = asNumber(Number(value)); if (name === "Value") current.heartRate = asNumber(Number(value)); if (name === "Cadence") current.cadence = asNumber(Number(value)); if (name === "Trackpoint") { points.push(current); current = undefined; } } if (lap !== undefined) { if (name === "TotalTimeSeconds") lap.durationSeconds = asNumber(Number(value)); if (name === "DistanceMeters" && current === undefined) lap.distanceMeters = asNumber(Number(value)); if (name === "Lap") { laps.push(lap); lap = undefined; } } text = ""; },
   );
-  return { format: "tcx.gz", points, laps };
+  return { format: "tcx.gz", points, laps, utcOffsetMinutes: null };
 }
 
 async function parseFit(path: string, compressed: boolean): Promise<DetailedActivity> {
@@ -90,9 +92,10 @@ async function parseFit(path: string, compressed: boolean): Promise<DetailedActi
   const { messages, errors } = decoder.read();
   if (errors.length) throw new Error("FIT decoder reported errors.");
   const records = messages.recordMesgs ?? []; const sourceLaps = messages.lapMesgs ?? [];
+  const activity = (messages.activityMesgs ?? [])[0] as Record<string, unknown> | undefined;
   const points = records.map((record: Record<string, unknown>) => ({ timestamp: asDate(record.timestamp), latitude: semicircles(record.positionLat), longitude: semicircles(record.positionLong), altitudeMeters: asNumber(record.enhancedAltitude) ?? asNumber(record.altitude), distanceMeters: asNumber(record.distance), heartRate: asNumber(record.heartRate), cadence: asNumber(record.cadence), powerWatts: asNumber(record.power), speedMetersPerSecond: asNumber(record.enhancedSpeed) ?? asNumber(record.speed) }));
   const laps = sourceLaps.map((lap: Record<string, unknown>) => ({ startedAt: asDate(lap.startTime), durationSeconds: asNumber(lap.totalTimerTime) ?? asNumber(lap.totalElapsedTime), distanceMeters: asNumber(lap.totalDistance), elevationGainMeters: asNumber(lap.totalAscent), averageHeartRate: asNumber(lap.avgHeartRate), averageCadence: asNumber(lap.avgCadence), averagePowerWatts: asNumber(lap.avgPower) }));
-  return { format: compressed ? "fit.gz" : "fit", points, laps };
+  return { format: compressed ? "fit.gz" : "fit", points, laps, utcOffsetMinutes: fitOffsetMinutes(activity) };
 }
 
 async function decode(path: string, format: DetailedActivity["format"]): Promise<DetailedActivity> {
@@ -101,12 +104,14 @@ async function decode(path: string, format: DetailedActivity["format"]): Promise
   return parseFit(path, format === "fit.gz");
 }
 
-export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string): Promise<object> {
-  const root = resolve(exportDir); const files = database.prepare(`SELECT activity_id AS activityId, relative_path AS relativePath FROM activity_files WHERE activity_id IS NOT NULL ${activityId === undefined ? "" : "AND activity_id = ?"}`).all(...(activityId === undefined ? [] : [activityId])) as { activityId: string; relativePath: string }[];
-  const results: { activityId: string; status: "decoded" | "skipped" | "failed"; pointCount?: number; lapCount?: number; error?: string }[] = [];
+export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string, timeZone?: string): Promise<object> {
+  const root = resolve(exportDir); const files = database.prepare(`SELECT id, activity_id AS activityId, relative_path AS relativePath FROM activity_files WHERE activity_id IS NOT NULL ${activityId === undefined ? "" : "AND activity_id = ?"}`).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string }[];
+  const results: { activityId: string; status: "decoded" | "skipped" | "failed"; pointCount?: number; lapCount?: number; utcOffsetMinutes?: number | null; error?: string }[] = [];
   for (const file of files) {
     const format = formatFor(file.relativePath); const path = resolve(root, file.relativePath);
-    if (format === null || !inRoot(root, path)) { database.prepare("UPDATE activity_files SET decode_status = ?, parse_error = ? WHERE activity_id = ?").run("skipped", "Unsupported or unsafe detailed file reference", file.activityId); results.push({ activityId: file.activityId, status: "skipped" }); continue; }
+    // Decode status and the decoded offset are facts about one file, so every
+    // write below is keyed by the file rather than by its activity.
+    if (format === null || !inRoot(root, path)) { database.prepare("UPDATE activity_files SET decode_status = ?, parse_error = ? WHERE id = ?").run("skipped", "Unsupported or unsafe detailed file reference", file.id); results.push({ activityId: file.activityId, status: "skipped" }); continue; }
     try {
       const detailed = await decode(path, format); const now = new Date().toISOString();
       const write = database.transaction(() => {
@@ -117,11 +122,13 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
         detailed.laps.forEach((item, sequence) => lap.run(file.activityId, sequence, item.startedAt, item.durationSeconds, item.distanceMeters, item.elevationGainMeters, item.averageHeartRate, item.averageCadence, item.averagePowerWatts, item.sourcePayload === undefined ? null : JSON.stringify(item.sourcePayload)));
         const bounds = database.prepare(`SELECT COUNT(*) AS pointCount, MIN(timestamp) AS startedAt, MAX(timestamp) AS endedAt, MIN(latitude) AS minLatitude, MIN(longitude) AS minLongitude, MAX(latitude) AS maxLatitude, MAX(longitude) AS maxLongitude, MAX(distance_meters) AS totalDistanceMeters, SUM(CASE WHEN altitude_meters > previousAltitude THEN altitude_meters - previousAltitude ELSE 0 END) AS elevationGainMeters FROM (SELECT *, LAG(altitude_meters) OVER (ORDER BY sequence) AS previousAltitude FROM activity_streams WHERE activity_id = ?)` ).get(file.activityId) as Record<string, unknown>;
         database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, bounds.elevationGainMeters, bounds.minLatitude === null ? 0 : 1, now);
-        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL WHERE activity_id = ?").run(format, file.activityId);
-      }); write(); results.push({ activityId: file.activityId, status: "decoded", pointCount: detailed.points.length, lapCount: detailed.laps.length });
-    } catch (error) { database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ? WHERE activity_id = ?").run("Detailed file could not be decoded", file.activityId); results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" }); }
+        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, file.id);
+      }); write(); results.push({ activityId: file.activityId, status: "decoded", pointCount: detailed.points.length, lapCount: detailed.laps.length, utcOffsetMinutes: detailed.utcOffsetMinutes });
+    } catch (error) { database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ? WHERE id = ?").run("Detailed file could not be decoded", file.id); results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" }); }
   }
-  return { decoded: results.filter((result) => result.status === "decoded").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, results };
+  // A newly decoded FIT offset supersedes the configured-zone fallback.
+  const coverage = resolveActivityLocalTimes(database, timeZone);
+  return { decoded: results.filter((result) => result.status === "decoded").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, offsetCoverage: coverage, results };
 }
 
 export function getActivityStream(database: Database, activityId: string, fields: readonly string[], maxPoints: number, startTime?: string, endTime?: string): object {

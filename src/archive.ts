@@ -1,4 +1,5 @@
 import type { Database } from "./database.js";
+import { offsetCoverage, TIME_COLUMNS, type TimeBasis } from "./localtime.js";
 
 export type ActivitySearchInput = Readonly<{
   sports?: readonly string[] | undefined;
@@ -22,6 +23,7 @@ export type AggregateInput = Readonly<{
   endDate?: string | undefined;
   groupBy?: "day" | "week" | "month" | "sport" | undefined;
   metrics?: readonly ("activityCount" | "distanceMeters" | "durationSeconds" | "elevationGainMeters" | "averageHeartRate" | "averageWatts" | "relativeEffort")[] | undefined;
+  timeBasis?: TimeBasis | undefined;
 }>;
 
 const ACTIVITY_FIELDS = [
@@ -100,10 +102,12 @@ export function searchActivities(database: Database, input: ActivitySearchInput)
 
 export function aggregateTraining(database: Database, input: AggregateInput): object {
   const { where, values } = filters(input);
+  const timeBasis = input.timeBasis ?? "local";
+  const time = TIME_COLUMNS[timeBasis];
   const grouping = {
-    day: "strftime('%Y-%m-%d', started_at)",
-    week: "strftime('%Y-%W', started_at)",
-    month: "strftime('%Y-%m', started_at)",
+    day: `strftime('%Y-%m-%d', ${time})`,
+    week: `strftime('%Y-%W', ${time})`,
+    month: `strftime('%Y-%m', ${time})`,
     sport: "COALESCE(sport_type, 'Unknown')",
   } as const;
   const metricExpressions = {
@@ -119,5 +123,10 @@ export function aggregateTraining(database: Database, input: AggregateInput): ob
   const requested = input.metrics?.length ? input.metrics : ["activityCount", "distanceMeters", "durationSeconds"] as const;
   const select = requested.map((metric) => `${metricExpressions[metric]} AS ${metric}`).join(", ");
   const groups = database.prepare(`SELECT ${grouping[groupBy]} AS period, ${select} FROM activities WHERE ${where.join(" AND ")} GROUP BY period ORDER BY period ASC`).all(...values);
-  return { groupBy, metrics: requested, groups };
+  return {
+    groupBy, metrics: requested, groups,
+    timeBasis: groupBy === "sport" ? "not-applicable" : timeBasis,
+    offsetCoverage: offsetCoverage(database),
+    definitions: { timeBasis: "Calendar periods are grouped in local time where an activity's UTC offset is known, and in UTC otherwise. Date-range filters always use the UTC instant." },
+  };
 }
