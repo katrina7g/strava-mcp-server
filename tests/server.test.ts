@@ -33,6 +33,13 @@ function textContent(result: unknown): string {
   return content[0]!.text;
 }
 
+/** Resource contents are text or binary; these resources are always text. */
+function resourceText(result: { contents: unknown[] }): string {
+  const first = result.contents[0] as { text?: unknown } | undefined;
+  if (first === undefined || typeof first.text !== "string") throw new Error("Expected a text resource.");
+  return first.text;
+}
+
 async function connectedClient(config: ServerConfig): Promise<{ server: McpServer; client: Client }> {
   const server = createServer(config);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -152,7 +159,11 @@ describe("MCP server tool surface", () => {
     expect(comparison.metrics.distanceMeters).toMatchObject({ baseline: 10000, comparison: 11000 });
     expect(bests.results[0]).toMatchObject({ id: "run-2" });
     expect(activity.analysis.averagePaceSecondsPerKm).toBe(350);
-    expect(activity.limitations[0]).toBe("Catalog-only analysis");
+    expect(activity.limitations[0]).toContain("Catalog-only analysis");
+    // Splits are unimplemented, not merely pending a detailed-format import.
+    expect(activity.limitations.join(" ")).toContain("not implemented");
+    expect(activity.limitations.join(" ")).not.toContain("until detailed");
+    expect(sports.capabilities.unavailable).toContain("not implemented");
     expect(load).toMatchObject({ source: "supplied catalog Training Load", groups: [expect.objectContaining({ trainingLoad: 40 }), expect.objectContaining({ trainingLoad: 55 })] });
     await client.close();
   });
@@ -174,6 +185,57 @@ describe("MCP server tool surface", () => {
     expect(privateRoute).toMatchObject({ includeLocation: false });
     expect(JSON.stringify(privateRoute)).not.toContain("-122.1");
     expect(route.geometry).toMatchObject({ type: "LineString", coordinates: [[-122.1, 37.1], [-122.2, 37.2]] });
+    await client.close();
+  });
+
+  it("serves get_activity with decode status, lap count, and no coordinates", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.2\"><ele>15</ele><time>2026-01-01T18:01:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const activity = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-1" } })));
+    const missing = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "absent" } })));
+
+    expect(activity).toMatchObject({ found: true, activity: { id: "gpx-1", sportType: "Run" } });
+    expect(activity.files[0]).toMatchObject({ format: "gpx", decodeStatus: "decoded" });
+    expect(activity.telemetry).toMatchObject({ imported: true, pointCount: 2, lapCount: 0, hasLocation: true });
+    // GPX supplies no per-point distance, so the catalog total is used and labelled.
+    expect(activity.derived).toMatchObject({ totalDistanceMeters: 100, totalDistanceSource: "catalog" });
+    expect(JSON.stringify(activity)).not.toContain("-122.1");
+    expect(missing).toMatchObject({ found: false });
+    await client.close();
+  });
+
+  it("reports per-field stream availability so absent metrics are not read as zero", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time><extensions><gpxtpx:hr xmlns:gpxtpx=\"x\">140</gpxtpx:hr></extensions></trkpt><trkpt lat=\"37.2\" lon=\"-122.2\"><ele>15</ele><time>2026-01-01T18:01:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1", fields: ["heartRate", "distanceMeters"] } })));
+
+    // One of two points has heart rate; GPX never supplies distance.
+    expect(stream.fieldAvailability).toEqual({ heartRate: 1, distanceMeters: 0 });
+    await client.close();
+  });
+
+  it("serves the schema, archive-summary, and privacy-policy resources", async () => {
+    const root = await temporaryDirectory();
+    const { client } = await connectedClient(loadConfig({ STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    const listed = await client.listResources();
+    const schema = await client.readResource({ uri: "strava://schema" });
+    const summary = await client.readResource({ uri: "strava://archive-summary" });
+    const privacy = await client.readResource({ uri: "strava://privacy-policy" });
+
+    expect(listed.resources.map((resource) => resource.uri).sort()).toEqual(["strava://archive-summary", "strava://privacy-policy", "strava://schema"]);
+    expect(JSON.parse(resourceText(schema))).toHaveProperty("activities");
+    expect(JSON.parse(resourceText(summary))).toHaveProperty("overview");
+    expect(resourceText(privacy)).toContain("includeLocation");
     await client.close();
   });
 

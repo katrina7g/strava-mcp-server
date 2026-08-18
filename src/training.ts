@@ -61,7 +61,8 @@ export function listSports(database: Database, filter: TrainingFilter): object {
     sports,
     capabilities: {
       generic: ["search", "count", "duration", "distance when present"],
-      catalogOnly: "Pace is an activity-level estimate. Splits, routes, and telemetry require detailed-format import.",
+      telemetry: "Routes, streams, and laps are available for activities whose detailed file has been decoded.",
+      unavailable: "Pace is an activity-level estimate. Split-based pacing and per-split telemetry are not implemented for any sport.",
     },
   };
 }
@@ -152,11 +153,17 @@ export function analyzeActivity(database: Database, activityId: string, analysis
   const movingSeconds = activity.movingSeconds ?? activity.durationSeconds;
   const pace = typeof activity.distanceMeters === "number" && activity.distanceMeters > 0 && typeof movingSeconds === "number" ? (movingSeconds * 1000) / activity.distanceMeters : null;
   const analysis = analysisType === "pace"
-    ? { averagePaceSecondsPerKm: pace, definition: "Activity-level moving-time pace; no split or route analysis is available until detailed files are imported." }
+    ? { averagePaceSecondsPerKm: pace, definition: "Activity-level moving-time pace over the whole activity. Split-based pacing is not implemented; use get_activity_stream for raw telemetry." }
     : analysisType === "intensity"
-      ? { relativeEffort: activity.relativeEffort, trainingLoad: activity.trainingLoad, intensity: activity.intensity, averageHeartRate: activity.averageHeartRate, averageWatts: activity.averageWatts, definition: "Values are source-supplied catalog fields. No telemetry progression or anomaly calculation is available yet." }
+      ? { relativeEffort: activity.relativeEffort, trainingLoad: activity.trainingLoad, intensity: activity.intensity, averageHeartRate: activity.averageHeartRate, averageWatts: activity.averageWatts, definition: "Values are source-supplied catalog fields. Telemetry progression and anomaly detection are not implemented." }
       : { durationSeconds: activity.durationSeconds, distanceMeters: activity.distanceMeters, elevationGainMeters: activity.elevationGainMeters, averagePaceSecondsPerKm: pace };
-  return { found: true, activity: { id: activity.id, name: activity.name, sportType: activity.sportType, startedAt: activity.startedAt }, analysisType, analysis, limitations: ["Catalog-only analysis", "No splits, pauses, route, or telemetry progression until detailed activity formats are imported."] };
+  return {
+    found: true, activity: { id: activity.id, name: activity.name, sportType: activity.sportType, startedAt: activity.startedAt }, analysisType, analysis,
+    limitations: [
+      "Catalog-only analysis: values come from the activity catalog, not from decoded telemetry.",
+      "Splits, pauses, and telemetry progression are not implemented. Decoded streams are reachable through get_activity_stream and get_activity_route.",
+    ],
+  };
 }
 
 export function getTrainingLoad(database: Database, input: TrainingFilter & { groupBy?: "week" | "month" | "sport" | undefined; preference?: "supplied" | "relativeEffort" | "duration" | undefined; timeBasis?: TimeBasis | undefined }): object {

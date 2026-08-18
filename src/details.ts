@@ -131,6 +131,18 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
   return { decoded: results.filter((result) => result.status === "decoded").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, offsetCoverage: coverage, results };
 }
 
+/**
+ * Bounds derive total distance from per-point distance, which GPX never
+ * supplies and TCX supplies only per lap: 222 of the 325 activities in the
+ * reference export have none. The catalog carries a total for every activity,
+ * so it is the fallback, and the source is always stated.
+ */
+export function resolveTotalDistance(streamDistance: number | null, catalogDistance: number | null): { meters: number | null; source: "stream" | "catalog" | "none" } {
+  if (streamDistance !== null) return { meters: streamDistance, source: "stream" };
+  if (catalogDistance !== null) return { meters: catalogDistance, source: "catalog" };
+  return { meters: null, source: "none" };
+}
+
 export function getActivityStream(database: Database, activityId: string, fields: readonly string[], maxPoints: number, startTime?: string, endTime?: string): object {
   const allowed = { timestamp: "timestamp", altitudeMeters: "altitude_meters", distanceMeters: "distance_meters", heartRate: "heart_rate", cadence: "cadence", powerWatts: "power_watts", speedMetersPerSecond: "speed_meters_per_second", latitude: "latitude", longitude: "longitude" } as const;
   const requested = fields.length ? fields : ["timestamp", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond"];
@@ -139,12 +151,30 @@ export function getActivityStream(database: Database, activityId: string, fields
   if (startTime !== undefined) { where.push("timestamp >= ?"); values.push(startTime); } if (endTime !== undefined) { where.push("timestamp < ?"); values.push(endTime); }
   const total = database.prepare(`SELECT COUNT(*) AS count FROM activity_streams WHERE ${where.join(" AND ")}`).get(...values) as { count: number };
   const points = selected.length ? database.prepare(`SELECT ${select} FROM activity_streams WHERE ${where.join(" AND ")} ORDER BY sequence LIMIT ?`).all(...values, maxPoints) : [];
-  return { activityId, fields: selected, points, totalPoints: total.count, truncated: total.count > maxPoints };
+  // A field a source never recorded reads as a column of nulls, which must not
+  // be mistaken for measured zeroes, so each field reports how much it has.
+  const availabilitySelect = selected.map((field) => `SUM(${allowed[field]} IS NOT NULL) AS ${field}`).join(", ");
+  const fieldAvailability = selected.length
+    ? database.prepare(`SELECT ${availabilitySelect} FROM activity_streams WHERE ${where.join(" AND ")}`).get(...values)
+    : {};
+  return {
+    activityId, fields: selected, points, totalPoints: total.count, truncated: total.count > maxPoints,
+    fieldAvailability,
+    note: "fieldAvailability counts points carrying each field across the selected window. A null value means the source did not record it, not zero.",
+  };
 }
 
 export function getActivityRoute(database: Database, activityId: string, includeLocation: boolean, maxPoints: number): object {
-  const bounds = database.prepare("SELECT point_count AS pointCount, started_at AS startedAt, ended_at AS endedAt, total_distance_meters AS totalDistanceMeters, elevation_gain_meters AS elevationGainMeters, has_location AS hasLocation FROM activity_bounds WHERE activity_id = ?").get(activityId);
-  if (bounds === undefined) return { activityId, available: false, message: "No detailed route has been imported for this activity." };
+  const stored = database.prepare(`
+    SELECT b.point_count AS pointCount, b.started_at AS startedAt, b.ended_at AS endedAt,
+      b.total_distance_meters AS streamDistanceMeters, a.distance_meters AS catalogDistanceMeters,
+      b.elevation_gain_meters AS elevationGainMeters, b.has_location AS hasLocation
+    FROM activity_bounds b LEFT JOIN activities a ON a.id = b.activity_id WHERE b.activity_id = ?
+  `).get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; catalogDistanceMeters: number | null; elevationGainMeters: number | null; hasLocation: number } | undefined;
+  if (stored === undefined) return { activityId, available: false, message: "No detailed route has been imported for this activity." };
+  const { streamDistanceMeters, catalogDistanceMeters, ...rest } = stored;
+  const distance = resolveTotalDistance(streamDistanceMeters, catalogDistanceMeters);
+  const bounds = { ...rest, totalDistanceMeters: distance.meters, totalDistanceSource: distance.source };
   if (!includeLocation) return { activityId, available: true, includeLocation: false, summary: bounds, message: "Coordinates are withheld by default. Set includeLocation to true for this single request." };
   const total = database.prepare("SELECT COUNT(*) AS count FROM activity_streams WHERE activity_id = ? AND latitude IS NOT NULL AND longitude IS NOT NULL").get(activityId) as { count: number };
   const stride = Math.max(1, Math.ceil(total.count / maxPoints));

@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { pathToFileURL } from "node:url";
 import { z } from "zod";
 import { loadConfig, type ServerConfig } from "./config.js";
-import { aggregateTraining, getArchiveSummary, getDataSchema, searchActivities } from "./archive.js";
+import { aggregateTraining, getActivity, getArchiveSummary, getDataSchema, searchActivities } from "./archive.js";
 import { importActivityCatalog } from "./catalog.js";
 import { closeDatabase, openDatabase } from "./database.js";
 import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
@@ -144,7 +144,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
   server.registerTool(
     "analyze_activity",
     {
-      title: "Analyze activity", description: "Provides catalog-level activity analysis. Splits, routes, and telemetry require detailed-format import.",
+      title: "Analyze activity", description: "Provides catalog-level activity analysis. Split-based pacing and telemetry progression are not implemented; decoded telemetry is available through get_activity_stream and get_activity_route.",
       inputSchema: z.object({ activityId: z.string().trim().min(1), analysisType: z.enum(["catalogSummary", "pace", "intensity"]).default("catalogSummary") }),
     },
     async ({ activityId, analysisType }) => withDatabase(config, (database) => analyzeActivity(database, activityId, analysisType)),
@@ -223,6 +223,16 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
   );
 
   server.registerTool(
+    "get_activity",
+    {
+      title: "Get activity",
+      description: "Returns one activity's catalog metadata, derived metrics, raw-file decode status, and telemetry availability. Never returns coordinates.",
+      inputSchema: z.object({ activityId: z.string().trim().min(1) }),
+    },
+    async ({ activityId }) => withDatabase(config, (database) => getActivity(database, activityId)),
+  );
+
+  server.registerTool(
     "search_activities",
     {
       title: "Search activities",
@@ -252,7 +262,58 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     async (input) => withDatabase(config, (database) => aggregateTraining(database, input)),
   );
 
+  registerResources(server, config);
   return server;
+}
+
+const PRIVACY_POLICY = `# Strava MCP privacy behaviour
+
+This server runs locally and reads a Strava export without modifying it.
+
+## Location
+- Exact coordinates are withheld by default.
+- \`get_activity_route\` returns coordinates only when \`includeLocation\` is
+  true, and the opt-in applies to that single request. It is never stored,
+  inferred, or reused as session state.
+- \`get_activity\` never returns coordinates at any detail level.
+
+## Never imported
+Profile, login, device-identifier, privacy-zone, preference, connected-app,
+contact, block, and flag sources, and \`messaging.json\`, are checksummed for
+change detection but never parsed into a queryable table. Media bytes are not
+ingested and EXIF is never extracted.
+
+## Bounded output
+List results paginate and telemetry is capped per request. Missing metrics are
+reported as unavailable rather than as zero.
+
+## Generated data
+The local database is created outside the export in a current-user-only
+directory. The source export is never written to.`;
+
+function registerResources(server: McpServer, config: ServerConfig): void {
+  server.registerResource(
+    "schema", "strava://schema",
+    { title: "Imported data schema", description: "Field names, types, units, privacy classification, and source column mapping.", mimeType: "application/json" },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await readThroughDatabase(config, (database) => getDataSchema(database))) }] }),
+  );
+
+  server.registerResource(
+    "archive-summary", "strava://archive-summary",
+    { title: "Archive summary", description: "Current import health, activity coverage, and sport counts.", mimeType: "application/json" },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "application/json", text: JSON.stringify(await readThroughDatabase(config, (database) => getArchiveSummary(database))) }] }),
+  );
+
+  server.registerResource(
+    "privacy-policy", "strava://privacy-policy",
+    { title: "Privacy policy", description: "Coordinate opt-in rules, redaction defaults, and sources that are never imported.", mimeType: "text/markdown" },
+    async (uri) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text: PRIVACY_POLICY }] }),
+  );
+}
+
+async function readThroughDatabase<T>(config: ServerConfig, action: (database: Awaited<ReturnType<typeof openDatabase>>) => T): Promise<T> {
+  const database = await openDatabase(config);
+  try { return action(database); } finally { closeDatabase(database); }
 }
 
 async function withDatabase(config: ServerConfig, action: (database: ReturnType<typeof openDatabase> extends Promise<infer T> ? T : never) => object): Promise<{ content: [{ type: "text"; text: string }] }> {
