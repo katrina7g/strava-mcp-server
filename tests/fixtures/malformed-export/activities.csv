@@ -1,0 +1,6 @@
+Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain
+good-1,"Jan 2, 2026, 7:00:00 AM",Valid Activity,Run,1800,3.1,activities/good-1.gpx,1750,5000,55
+missing-file,"Jan 3, 2026, 7:00:00 AM",Referenced File Absent,Run,1800,3.1,activities/absent.gpx,1750,5000,55
+unsafe-path,"Jan 4, 2026, 7:00:00 AM",Escapes The Export,Run,1800,3.1,../outside.gpx,1750,5000,55
+broken-gzip,"Jan 5, 2026, 7:00:00 AM",Corrupt Compressed,Run,1800,3.1,activities/broken.fit.gz,1750,5000,55
+short-row,"Jan 6, 2026, 7:00:00 AM",Too Few Columns,Run
