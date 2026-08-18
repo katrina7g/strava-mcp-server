@@ -224,6 +224,31 @@ describe("MCP server tool surface", () => {
     await client.close();
   });
 
+  it("withholds stream coordinates unless includeLocation is set on the request", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+
+    const fields = ["timestamp", "latitude", "longitude"];
+    const withheld = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1", fields } })));
+    const granted = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1", fields, includeLocation: true } })));
+    const defaulted = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1" } })));
+
+    // Naming the coordinate fields is not consent; they are dropped and reported.
+    expect(withheld.fields).toEqual(["timestamp"]);
+    expect(withheld.withheldFields).toEqual(["latitude", "longitude"]);
+    expect(JSON.stringify(withheld)).not.toContain("37.1");
+    expect(JSON.stringify(withheld)).not.toContain("-122.1");
+    // The opt-in is per request and never carried over.
+    expect(granted.points[0]).toMatchObject({ latitude: 37.1, longitude: -122.1 });
+    expect(JSON.stringify(defaulted)).not.toContain("37.1");
+    await client.close();
+  });
+
   it("serves the schema, archive-summary, and privacy-policy resources", async () => {
     const root = await temporaryDirectory();
     const { client } = await connectedClient(loadConfig({ STRAVA_MCP_DATA_DIR: join(root, "cache") }));

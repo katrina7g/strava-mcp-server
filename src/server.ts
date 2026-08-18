@@ -81,13 +81,14 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
   server.registerTool(
     "get_activity_stream",
     {
-      title: "Get activity stream", description: "Returns bounded imported telemetry. Coordinates require explicit fields including latitude and longitude.",
+      title: "Get activity stream", description: "Returns bounded imported telemetry. Coordinates are withheld unless includeLocation is explicitly true, and that opt-in applies only to the single request that sets it.",
       inputSchema: z.object({
         activityId: z.string().trim().min(1), fields: z.array(z.enum(["timestamp", "altitudeMeters", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond", "latitude", "longitude"])).max(9).optional(),
+        includeLocation: z.boolean().default(false),
         maxPoints: z.number().int().min(1).max(MAX_STREAM_POINTS).optional(), startTime: optionalDate, endTime: optionalDate,
       }).refine((input) => input.startTime === undefined || input.endTime === undefined || input.startTime < input.endTime, { message: "startTime must be before endTime." }),
     },
-    async ({ activityId, fields, maxPoints, startTime, endTime }) => withDatabase(config, (database) => getActivityStream(database, activityId, fields ?? [], maxPoints ?? 250, startTime, endTime)),
+    async ({ activityId, fields, includeLocation, maxPoints, startTime, endTime }) => withDatabase(config, (database) => getActivityStream(database, activityId, fields ?? [], includeLocation, maxPoints ?? 250, startTime, endTime)),
   );
 
   server.registerTool(
@@ -271,10 +272,13 @@ const PRIVACY_POLICY = `# Strava MCP privacy behaviour
 This server runs locally and reads a Strava export without modifying it.
 
 ## Location
-- Exact coordinates are withheld by default.
-- \`get_activity_route\` returns coordinates only when \`includeLocation\` is
-  true, and the opt-in applies to that single request. It is never stored,
-  inferred, or reused as session state.
+- Exact coordinates are withheld by default. Two tools can return them, and
+  each requires \`includeLocation\` to be explicitly true on that request. The
+  opt-in is never stored, inferred, or reused as session state.
+- \`get_activity_route\` returns a simplified route only with \`includeLocation\`.
+- \`get_activity_stream\` returns latitude and longitude only with
+  \`includeLocation\`. Naming those fields alone is not sufficient: they are
+  dropped from the response and reported as withheld.
 - \`get_activity\` never returns coordinates at any detail level.
 
 ## Never imported

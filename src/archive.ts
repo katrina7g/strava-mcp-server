@@ -133,7 +133,7 @@ export function getDataSchema(database: Database, domain?: string): object {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
     sourceColumnMap: latestMap === undefined ? null : { mapVersion: latestMap.mapVersion, columns: JSON.parse(latestMap.columns) },
-    note: "Exact coordinates, direct identifiers, and raw source values are not exposed by activity query tools.",
+    note: "Direct identifiers and raw source values are not exposed by activity query tools. Exact coordinates are withheld unless a request to get_activity_route or get_activity_stream sets includeLocation to true.",
   };
 }
 

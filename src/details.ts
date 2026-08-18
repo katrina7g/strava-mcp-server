@@ -143,10 +143,16 @@ export function resolveTotalDistance(streamDistance: number | null, catalogDista
   return { meters: null, source: "none" };
 }
 
-export function getActivityStream(database: Database, activityId: string, fields: readonly string[], maxPoints: number, startTime?: string, endTime?: string): object {
+const LOCATION_FIELDS = new Set(["latitude", "longitude"]);
+
+export function getActivityStream(database: Database, activityId: string, fields: readonly string[], includeLocation: boolean, maxPoints: number, startTime?: string, endTime?: string): object {
   const allowed = { timestamp: "timestamp", altitudeMeters: "altitude_meters", distanceMeters: "distance_meters", heartRate: "heart_rate", cadence: "cadence", powerWatts: "power_watts", speedMetersPerSecond: "speed_meters_per_second", latitude: "latitude", longitude: "longitude" } as const;
   const requested = fields.length ? fields : ["timestamp", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond"];
-  const selected = requested.filter((field): field is keyof typeof allowed => field in allowed);
+  const permitted = requested.filter((field): field is keyof typeof allowed => field in allowed);
+  // Naming a coordinate field is not consent to receive it: exact location
+  // requires the explicit per-request opt-in, and it is never carried over.
+  const withheldFields = includeLocation ? [] : permitted.filter((field) => LOCATION_FIELDS.has(field));
+  const selected = permitted.filter((field) => includeLocation || !LOCATION_FIELDS.has(field));
   const select = selected.map((field) => `${allowed[field]} AS ${field}`).join(", "); const where = ["activity_id = ?"]; const values: unknown[] = [activityId];
   if (startTime !== undefined) { where.push("timestamp >= ?"); values.push(startTime); } if (endTime !== undefined) { where.push("timestamp < ?"); values.push(endTime); }
   const total = database.prepare(`SELECT COUNT(*) AS count FROM activity_streams WHERE ${where.join(" AND ")}`).get(...values) as { count: number };
@@ -159,7 +165,8 @@ export function getActivityStream(database: Database, activityId: string, fields
     : {};
   return {
     activityId, fields: selected, points, totalPoints: total.count, truncated: total.count > maxPoints,
-    fieldAvailability,
+    fieldAvailability, includeLocation,
+    ...(withheldFields.length ? { withheldFields, withheldReason: "Coordinates are withheld unless includeLocation is true. The opt-in applies to this request only." } : {}),
     note: "fieldAvailability counts points carrying each field across the selected window. A null value means the source did not record it, not zero.",
   };
 }
