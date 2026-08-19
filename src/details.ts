@@ -1,11 +1,15 @@
 import { Decoder, Stream } from "@garmin/fitsdk";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { createGunzip } from "node:zlib";
 import { SaxesParser } from "saxes";
 import type { Database } from "./database.js";
+import { elevationGainMeters } from "./elevation.js";
+import { logInternalError } from "./errors.js";
+import { simplifyToLimit } from "./geometry.js";
 import { fitOffsetMinutes, resolveActivityLocalTimes } from "./localtime.js";
+import { withinRoot } from "./paths.js";
 
 const MAX_COMPRESSED_BYTES = 50 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024;
@@ -15,10 +19,6 @@ export type StreamPoint = { timestamp: string | null; latitude: number | null; l
 export type Lap = { startedAt: string | null; durationSeconds: number | null; distanceMeters: number | null; elevationGainMeters: number | null; averageHeartRate: number | null; averageCadence: number | null; averagePowerWatts: number | null; sourcePayload?: Record<string, unknown> };
 type DetailedActivity = { format: "gpx" | "fit" | "fit.gz" | "tcx.gz"; points: StreamPoint[]; laps: Lap[]; utcOffsetMinutes: number | null };
 
-function inRoot(root: string, candidate: string): boolean {
-  const difference = relative(root, candidate);
-  return difference === "" || (!difference.startsWith(`..${sep}`) && difference !== ".." && !isAbsolute(difference));
-}
 function asNumber(value: unknown): number | null { return typeof value === "number" && Number.isFinite(value) ? value : null; }
 function asDate(value: unknown): string | null {
   if (value instanceof Date && !Number.isNaN(value.valueOf())) return value.toISOString();
@@ -63,30 +63,74 @@ async function parseXml(path: string, compressed: boolean, onOpen: (name: string
   if (error !== undefined) throw error;
 }
 
+/**
+ * Real GPX extension fields nest an extra wrapper element deep — a device's
+ * TrackPointExtension between `<extensions>` and `<gpxtpx:hr>` — so the
+ * immediate-parent check used for `ele`/`time` is too strict for them.
+ * Requiring an `extensions` ancestor anywhere on the stack matches both the
+ * reference export's real files and the flatter shape used in tests, while
+ * still refusing a same-named element that appears outside any extension.
+ */
 async function parseGpx(path: string): Promise<DetailedActivity> {
-  const points: StreamPoint[] = []; let current: StreamPoint | undefined; let element = ""; let text = "";
+  const points: StreamPoint[] = []; let current: StreamPoint | undefined; const stack: string[] = []; let text = "";
   await parseXml(path, false,
-    (name, attributes) => { element = name; text = ""; if (name === "trkpt") current = { timestamp: null, latitude: asNumber(Number(attributes.lat)), longitude: asNumber(Number(attributes.lon)), altitudeMeters: null, distanceMeters: null, heartRate: null, cadence: null, powerWatts: null, speedMetersPerSecond: null }; },
+    (name, attributes) => { stack.push(name); text = ""; if (name === "trkpt") current = { timestamp: null, latitude: asNumber(Number(attributes.lat)), longitude: asNumber(Number(attributes.lon)), altitudeMeters: null, distanceMeters: null, heartRate: null, cadence: null, powerWatts: null, speedMetersPerSecond: null }; },
     (value) => { text += value; },
-    (name) => { if (current !== undefined) { const value = text.trim(); if (name === "ele") current.altitudeMeters = asNumber(Number(value)); if (name === "time") current.timestamp = asDate(value); if (name === "hr") current.heartRate = asNumber(Number(value)); if (name === "cad") current.cadence = asNumber(Number(value)); if (name === "power") current.powerWatts = asNumber(Number(value)); if (name === "speed") current.speedMetersPerSecond = asNumber(Number(value)); if (name === "trkpt") { points.push(current); current = undefined; } } element = ""; text = ""; },
+    (name) => {
+      if (current !== undefined) {
+        const value = text.trim();
+        const parent = stack[stack.length - 2];
+        const withinExtensions = stack.slice(0, -1).includes("extensions");
+        if (name === "ele" && parent === "trkpt") current.altitudeMeters = asNumber(Number(value));
+        if (name === "time" && parent === "trkpt") current.timestamp = asDate(value);
+        if (name === "hr" && withinExtensions) current.heartRate = asNumber(Number(value));
+        if (name === "cad" && withinExtensions) current.cadence = asNumber(Number(value));
+        if (name === "power" && withinExtensions) current.powerWatts = asNumber(Number(value));
+        if (name === "speed" && withinExtensions) current.speedMetersPerSecond = asNumber(Number(value));
+        if (name === "trkpt") { points.push(current); current = undefined; }
+      }
+      stack.pop(); text = "";
+    },
   );
   // GPX and TCX carry UTC only; no local offset can be recovered from them.
   return { format: "gpx", points, laps: [], utcOffsetMinutes: null };
 }
 
 async function parseTcx(path: string): Promise<DetailedActivity> {
-  const points: StreamPoint[] = []; const laps: Lap[] = []; let current: StreamPoint | undefined; let lap: Lap | undefined; let text = "";
+  const points: StreamPoint[] = []; const laps: Lap[] = []; let current: StreamPoint | undefined; let lap: Lap | undefined; const stack: string[] = []; let text = "";
   await parseXml(path, true,
-    (name, attributes) => { text = ""; if (name === "Trackpoint") current = { timestamp: null, latitude: null, longitude: null, altitudeMeters: null, distanceMeters: null, heartRate: null, cadence: null, powerWatts: null, speedMetersPerSecond: null }; if (name === "Lap") lap = { startedAt: asDate(attributes.StartTime), durationSeconds: null, distanceMeters: null, elevationGainMeters: null, averageHeartRate: null, averageCadence: null, averagePowerWatts: null }; },
+    (name, attributes) => { stack.push(name); text = ""; if (name === "Trackpoint") current = { timestamp: null, latitude: null, longitude: null, altitudeMeters: null, distanceMeters: null, heartRate: null, cadence: null, powerWatts: null, speedMetersPerSecond: null }; if (name === "Lap") lap = { startedAt: asDate(attributes.StartTime), durationSeconds: null, distanceMeters: null, elevationGainMeters: null, averageHeartRate: null, averageCadence: null, averagePowerWatts: null }; },
     (value) => { text += value; },
-    (name) => { const value = text.trim(); if (current !== undefined) { if (name === "Time") current.timestamp = asDate(value); if (name === "LatitudeDegrees") current.latitude = asNumber(Number(value)); if (name === "LongitudeDegrees") current.longitude = asNumber(Number(value)); if (name === "AltitudeMeters") current.altitudeMeters = asNumber(Number(value)); if (name === "DistanceMeters") current.distanceMeters = asNumber(Number(value)); if (name === "Value") current.heartRate = asNumber(Number(value)); if (name === "Cadence") current.cadence = asNumber(Number(value)); if (name === "Trackpoint") { points.push(current); current = undefined; } } if (lap !== undefined) { if (name === "TotalTimeSeconds") lap.durationSeconds = asNumber(Number(value)); if (name === "DistanceMeters" && current === undefined) lap.distanceMeters = asNumber(Number(value)); if (name === "Lap") { laps.push(lap); lap = undefined; } } text = ""; },
+    (name) => {
+      const value = text.trim();
+      // `<Value>` appears under more than one parent in TCX (heart rate today,
+      // potentially other sensor extensions from another device); only its
+      // immediate parent identifies what it means.
+      const parent = stack[stack.length - 2];
+      if (current !== undefined) {
+        if (name === "Time") current.timestamp = asDate(value);
+        if (name === "LatitudeDegrees") current.latitude = asNumber(Number(value));
+        if (name === "LongitudeDegrees") current.longitude = asNumber(Number(value));
+        if (name === "AltitudeMeters") current.altitudeMeters = asNumber(Number(value));
+        if (name === "DistanceMeters") current.distanceMeters = asNumber(Number(value));
+        if (name === "Value" && parent === "HeartRateBpm") current.heartRate = asNumber(Number(value));
+        if (name === "Cadence") current.cadence = asNumber(Number(value));
+        if (name === "Trackpoint") { points.push(current); current = undefined; }
+      }
+      if (lap !== undefined) {
+        if (name === "TotalTimeSeconds") lap.durationSeconds = asNumber(Number(value));
+        if (name === "DistanceMeters" && current === undefined) lap.distanceMeters = asNumber(Number(value));
+        if (name === "Lap") { laps.push(lap); lap = undefined; }
+      }
+      stack.pop(); text = "";
+    },
   );
   return { format: "tcx.gz", points, laps, utcOffsetMinutes: null };
 }
 
 async function parseFit(path: string, compressed: boolean): Promise<DetailedActivity> {
+  if (!compressed && (await stat(path)).size > MAX_DECOMPRESSED_BYTES) throw new Error("FIT source exceeds import limit.");
   const bytes = compressed ? await readGzipLimited(path) : await readFile(path);
-  if (bytes.length > MAX_DECOMPRESSED_BYTES) throw new Error("FIT source exceeds import limit.");
   const decoder = new Decoder(Stream.fromBuffer(bytes));
   if (!decoder.isFIT()) throw new Error("Source is not a FIT file.");
   const { messages, errors } = decoder.read();
@@ -104,14 +148,31 @@ async function decode(path: string, format: DetailedActivity["format"]): Promise
   return parseFit(path, format === "fit.gz");
 }
 
+// Sensor/GPS altitude jitters by less than this between samples; counting
+// every positive tick as "climbed" overstates gain against the source
+// figure. See elevation.ts for why this is a hysteresis band, not a
+// per-step gate.
+const ELEVATION_NOISE_THRESHOLD_METERS = 1;
+
 export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string, timeZone?: string): Promise<object> {
   const root = resolve(exportDir); const files = database.prepare(`SELECT id, activity_id AS activityId, relative_path AS relativePath FROM activity_files WHERE activity_id IS NOT NULL ${activityId === undefined ? "" : "AND activity_id = ?"}`).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string }[];
+  // A file's detail row can outlive the source that produced it — an export
+  // may drop a file between snapshots. Decoding only proceeds for paths the
+  // latest validation actually observed, not merely ones once recorded.
+  const observedPaths = new Set((database.prepare(`
+    SELECT relative_path AS relativePath FROM source_manifest
+    WHERE snapshot_id = (SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1)
+  `).all() as { relativePath: string }[]).map((row) => row.relativePath));
   const results: { activityId: string; status: "decoded" | "skipped" | "failed"; pointCount?: number; lapCount?: number; utcOffsetMinutes?: number | null; error?: string }[] = [];
   for (const file of files) {
     const format = formatFor(file.relativePath); const path = resolve(root, file.relativePath);
     // Decode status and the decoded offset are facts about one file, so every
     // write below is keyed by the file rather than by its activity.
-    if (format === null || !inRoot(root, path)) { database.prepare("UPDATE activity_files SET decode_status = ?, parse_error = ? WHERE id = ?").run("skipped", "Unsupported or unsafe detailed file reference", file.id); results.push({ activityId: file.activityId, status: "skipped" }); continue; }
+    if (format === null || !withinRoot(root, path) || !observedPaths.has(file.relativePath)) {
+      database.prepare("UPDATE activity_files SET decode_status = ?, parse_error = ? WHERE id = ?").run("skipped", "Unsupported, unsafe, or unvalidated detailed file reference", file.id);
+      results.push({ activityId: file.activityId, status: "skipped" });
+      continue;
+    }
     try {
       const detailed = await decode(path, format); const now = new Date().toISOString();
       const write = database.transaction(() => {
@@ -120,11 +181,24 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
         detailed.points.forEach((point, sequence) => stream.run(file.activityId, sequence, point.timestamp, point.latitude, point.longitude, point.altitudeMeters, point.distanceMeters, point.heartRate, point.cadence, point.powerWatts, point.speedMetersPerSecond, point.sourcePayload === undefined ? null : JSON.stringify(point.sourcePayload)));
         const lap = database.prepare("INSERT INTO activity_laps (activity_id, sequence, started_at, duration_seconds, distance_meters, elevation_gain_meters, average_heart_rate, average_cadence, average_power_watts, source_payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         detailed.laps.forEach((item, sequence) => lap.run(file.activityId, sequence, item.startedAt, item.durationSeconds, item.distanceMeters, item.elevationGainMeters, item.averageHeartRate, item.averageCadence, item.averagePowerWatts, item.sourcePayload === undefined ? null : JSON.stringify(item.sourcePayload)));
-        const bounds = database.prepare(`SELECT COUNT(*) AS pointCount, MIN(timestamp) AS startedAt, MAX(timestamp) AS endedAt, MIN(latitude) AS minLatitude, MIN(longitude) AS minLongitude, MAX(latitude) AS maxLatitude, MAX(longitude) AS maxLongitude, MAX(distance_meters) AS totalDistanceMeters, SUM(CASE WHEN altitude_meters > previousAltitude THEN altitude_meters - previousAltitude ELSE 0 END) AS elevationGainMeters FROM (SELECT *, LAG(altitude_meters) OVER (ORDER BY sequence) AS previousAltitude FROM activity_streams WHERE activity_id = ?)` ).get(file.activityId) as Record<string, unknown>;
-        database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, bounds.elevationGainMeters, bounds.minLatitude === null ? 0 : 1, now);
+        const bounds = database.prepare(`
+          SELECT COUNT(*) AS pointCount, MIN(timestamp) AS startedAt, MAX(timestamp) AS endedAt,
+            MIN(latitude) AS minLatitude, MIN(longitude) AS minLongitude, MAX(latitude) AS maxLatitude, MAX(longitude) AS maxLongitude,
+            MAX(distance_meters) AS totalDistanceMeters
+          FROM activity_streams WHERE activity_id = ?
+        `).get(file.activityId) as Record<string, unknown>;
+        // Hysteresis needs the ordered series itself, not an aggregate SQL can
+        // express in one pass — see elevation.ts.
+        const altitudes = (database.prepare("SELECT altitude_meters AS altitude FROM activity_streams WHERE activity_id = ? ORDER BY sequence").all(file.activityId) as { altitude: number | null }[]).map((row) => row.altitude);
+        const gain = elevationGainMeters(altitudes, ELEVATION_NOISE_THRESHOLD_METERS);
+        database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, gain, bounds.minLatitude === null ? 0 : 1, now);
         database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, file.id);
       }); write(); results.push({ activityId: file.activityId, status: "decoded", pointCount: detailed.points.length, lapCount: detailed.laps.length, utcOffsetMinutes: detailed.utcOffsetMinutes });
-    } catch (error) { database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ? WHERE id = ?").run("Detailed file could not be decoded", file.id); results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" }); }
+    } catch (error) {
+      logInternalError(`decoding ${file.relativePath}`, error);
+      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ? WHERE id = ?").run("Detailed file could not be decoded", file.id);
+      results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" });
+    }
   }
   // A newly decoded FIT offset supersedes the configured-zone fallback.
   const coverage = resolveActivityLocalTimes(database, timeZone);
@@ -171,6 +245,8 @@ export function getActivityStream(database: Database, activityId: string, fields
   };
 }
 
+const DEFAULT_ROUTE_TOLERANCE_METERS = 5;
+
 export function getActivityRoute(database: Database, activityId: string, includeLocation: boolean, maxPoints: number): object {
   const stored = database.prepare(`
     SELECT b.point_count AS pointCount, b.started_at AS startedAt, b.ended_at AS endedAt,
@@ -182,9 +258,19 @@ export function getActivityRoute(database: Database, activityId: string, include
   const { streamDistanceMeters, catalogDistanceMeters, ...rest } = stored;
   const distance = resolveTotalDistance(streamDistanceMeters, catalogDistanceMeters);
   const bounds = { ...rest, totalDistanceMeters: distance.meters, totalDistanceSource: distance.source };
-  if (!includeLocation) return { activityId, available: true, includeLocation: false, summary: bounds, message: "Coordinates are withheld by default. Set includeLocation to true for this single request." };
-  const total = database.prepare("SELECT COUNT(*) AS count FROM activity_streams WHERE activity_id = ? AND latitude IS NOT NULL AND longitude IS NOT NULL").get(activityId) as { count: number };
-  const stride = Math.max(1, Math.ceil(total.count / maxPoints));
-  const coordinates = database.prepare("SELECT longitude, latitude FROM activity_streams WHERE activity_id = ? AND latitude IS NOT NULL AND longitude IS NOT NULL AND sequence % ? = 0 ORDER BY sequence LIMIT ?").all(activityId, stride, maxPoints) as { longitude: number; latitude: number }[];
-  return { activityId, available: true, includeLocation: true, geometry: { type: "LineString", coordinates: coordinates.map((point) => [point.longitude, point.latitude]) }, summary: bounds, simplified: stride > 1 };
+  // elevationGainMeters here is computed from device altitude with basic
+  // hysteresis smoothing, not Strava's own corrected figure; the two can
+  // diverge, especially on undulating terrain where server-side elevation
+  // correction typically reports less gain than raw device altitude.
+  const definitions = { elevationGainMeters: "Derived from device altitude with noise smoothing; may diverge from Strava's own corrected value." };
+  if (!includeLocation) return { activityId, available: true, includeLocation: false, summary: bounds, definitions, message: "Coordinates are withheld by default. Set includeLocation to true for this single request." };
+  const source = database.prepare("SELECT longitude, latitude FROM activity_streams WHERE activity_id = ? AND latitude IS NOT NULL AND longitude IS NOT NULL ORDER BY sequence").all(activityId) as { longitude: number; latitude: number }[];
+  const { points: reduced, toleranceMeters } = simplifyToLimit(source, maxPoints, DEFAULT_ROUTE_TOLERANCE_METERS);
+  const simplified = reduced.length < source.length;
+  return {
+    activityId, available: true, includeLocation: true,
+    geometry: { type: "LineString", coordinates: reduced.map((point) => [point.longitude, point.latitude]) },
+    summary: bounds, simplified, definitions,
+    ...(simplified ? { simplificationToleranceMeters: toleranceMeters } : {}),
+  };
 }

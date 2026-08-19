@@ -2,9 +2,10 @@ import { createHash } from "node:crypto";
 import { createReadStream, type Dirent } from "node:fs";
 import { access, realpath, readdir, readFile, stat } from "node:fs/promises";
 import { createGunzip } from "node:zlib";
-import { basename, extname, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, extname, isAbsolute, resolve } from "node:path";
 import type { Database } from "./database.js";
 import { logInternalError } from "./errors.js";
+import { withinRoot } from "./paths.js";
 
 export type Finding = { code: string; severity: "warning" | "error"; path?: string; message: string };
 export type ManifestEntry = { relativePath: string; sourceKind: string; format: string | null; sizeBytes: number | null; sha256: string | null; status: "new" | "changed" | "unchanged" | "read-failed"; recordCount: number | null; isEmpty: boolean; errorSummary: string | null };
@@ -12,11 +13,6 @@ export type ValidationReport = { outcome: "completed" | "completed-with-errors";
 
 const REQUIRED_CATALOG = "activities.csv";
 const OPTIONAL_DIRECTORIES = new Set(["activities", "media", "clubs", "routes"]);
-
-function within(root: string, candidate: string): boolean {
-  const difference = relative(root, candidate);
-  return difference === "" || (!difference.startsWith(`..${sep}`) && difference !== ".." && !isAbsolute(difference));
-}
 
 async function safeRoot(exportDir: string): Promise<string> {
   const source = await realpath(exportDir);
@@ -41,7 +37,7 @@ async function filesUnder(root: string, directory: string, unreadableDirectories
     const target = resolve(root, child);
     if (entry.isSymbolicLink()) {
       try {
-        if (!within(root, await realpath(target))) continue;
+        if (!withinRoot(root, await realpath(target))) continue;
       } catch { continue; }
     }
     if (entry.isDirectory()) results.push(...await filesUnder(root, child, unreadableDirectories));
@@ -98,7 +94,7 @@ async function gzipReadable(path: string): Promise<boolean> {
 function safelyReferenced(root: string, approvedDirectory: string, reference: string): boolean {
   if (!reference || isAbsolute(reference) || reference.includes("\\")) return false;
   const candidate = resolve(root, reference);
-  return within(resolve(root, approvedDirectory), candidate);
+  return withinRoot(resolve(root, approvedDirectory), candidate);
 }
 
 export async function validateExport(exportDir: string, database: Database): Promise<ValidationReport> {

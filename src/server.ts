@@ -178,14 +178,13 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_activity_catalog",
     {
       title: "Import activity catalog",
-      description: "Imports the validated activities.csv catalog into the local database. Never changes the source export.",
-      inputSchema: z.object({}),
+      description: "Imports the validated activities.csv catalog into the local database. Reuses the latest validation snapshot by default; pass revalidate to force a fresh one. Never changes the source export.",
+      inputSchema: z.object({ revalidate: z.boolean().default(false) }),
     },
-    async () => withExport(config, "import_activity_catalog", async (exportDir, database) => {
-      const validation = await validateExport(exportDir, database);
-      const snapshot = database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number };
-      const imported = await importActivityCatalog(exportDir, database, snapshot.id, config.timeZone);
-      return { validation: { outcome: validation.outcome, delta: validation.summary }, catalogDelta: imported };
+    async ({ revalidate }) => withExport(config, "import_activity_catalog", async (exportDir, database) => {
+      const snapshotId = revalidate ? await freshSnapshotId(exportDir, database) : await latestSnapshotId(exportDir, database);
+      const imported = await importActivityCatalog(exportDir, database, snapshotId, config.timeZone);
+      return { snapshotId, catalogDelta: imported };
     }),
   );
 
@@ -337,11 +336,15 @@ async function readThroughDatabase<T>(config: ServerConfig, context: string, act
   finally { closeDatabase(database); }
 }
 
-/** Supporting import reuses the most recent completed snapshot so validating
- * and importing in sequence records one snapshot rather than two. */
+/** Import tools reuse the most recent completed snapshot so validating and
+ * importing in sequence records one snapshot rather than two. */
 async function latestSnapshotId(exportDir: string, database: Awaited<ReturnType<typeof openDatabase>>): Promise<number> {
   const existing = database.prepare("SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1").get() as { id: number } | undefined;
   if (existing !== undefined) return existing.id;
+  return freshSnapshotId(exportDir, database);
+}
+
+async function freshSnapshotId(exportDir: string, database: Awaited<ReturnType<typeof openDatabase>>): Promise<number> {
   await validateExport(exportDir, database);
   return (database.prepare("SELECT id FROM export_snapshots ORDER BY id DESC LIMIT 1").get() as { id: number }).id;
 }

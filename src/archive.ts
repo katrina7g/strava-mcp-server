@@ -167,6 +167,7 @@ export function getActivity(database: Database, activityId: string): object {
     limitations: [
       "Coordinates are never returned by this tool; use get_activity_route with includeLocation.",
       "Split counts and split-based pacing require detailed analysis, which is not implemented.",
+      "telemetry.elevationGainMeters is computed from raw device altitude with basic noise smoothing, not Strava's own corrected figure; it can diverge from activity.elevationGainMeters, especially on undulating terrain.",
     ],
   };
 }
