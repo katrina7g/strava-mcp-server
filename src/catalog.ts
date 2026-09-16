@@ -115,8 +115,8 @@ function parseBoolean(value: string | undefined): boolean | null {
 
 /**
  * Export timestamps are UTC but carry no zone marker: a catalog value of
- * `Mar 27, 2026, 1:28:59 AM` is the same instant as its linked GPX
- * `2026-03-27T01:28:59Z`. A lenient `new Date` resolves that format in the
+ * `Sep 12, 2026, 2:15:00 AM` is the same instant as a linked GPX
+ * `2026-09-12T02:15:00Z`. A lenient `new Date` resolves that format in the
  * host's zone, which would make the stored instant depend on where the
  * importer ran. Commas are optional because not every export writes them.
  */

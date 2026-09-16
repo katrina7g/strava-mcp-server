@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 9;
+const LATEST_SCHEMA_VERSION = 11;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -58,6 +58,8 @@ function migrate(database: Database): void {
     if (currentVersion < 7) migrationSeven(database);
     if (currentVersion < 8) migrationEight(database);
     if (currentVersion < 9) migrationNine(database);
+    if (currentVersion < 10) migrationTen(database);
+    if (currentVersion < 11) migrationEleven(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -339,6 +341,86 @@ function migrationNine(database: Database): void {
       invalid_count INTEGER NOT NULL,
       PRIMARY KEY (snapshot_id, source_path)
     );
+  `);
+}
+
+/** Distance provenance is per stream point because a single activity can have
+ * decoder-supplied FIT distance alongside derived GPS distance in a future
+ * multi-file import. Bounds use the source of their terminal distance. */
+function migrationTen(database: Database): void {
+  database.exec(`
+    ALTER TABLE activity_streams ADD COLUMN distance_source TEXT NOT NULL DEFAULT 'none';
+    ALTER TABLE activity_bounds ADD COLUMN distance_source TEXT NOT NULL DEFAULT 'none';
+  `);
+  // Before this version no distance was ever synthesized: GPX decoding left
+  // the field null, while TCX and FIT copied a value the file itself carried.
+  // Any stored distance is therefore decoder-supplied, and backfilling that
+  // label keeps it through the version-eleven rebuild instead of discarding
+  // correct data that only a full re-decode could restore.
+  database.exec(`
+    UPDATE activity_streams SET distance_source = 'supplied' WHERE distance_meters IS NOT NULL;
+    UPDATE activity_bounds SET distance_source = 'supplied' WHERE total_distance_meters IS NOT NULL;
+  `);
+}
+
+function migrationEleven(database: Database): void {
+  // Version ten briefly constrained the source enum before the approved
+  // catalog-normalized policy existed. Rebuild to support that value while
+  // retaining all rows. Supplied distance survives; any other stored value
+  // predates this derivation version and is cleared rather than relabelled,
+  // because only a re-import can establish whether its route is eligible.
+  database.exec(`
+    CREATE TABLE activity_streams_next (
+      id INTEGER PRIMARY KEY,
+      activity_id TEXT NOT NULL REFERENCES activities(id), sequence INTEGER NOT NULL,
+      timestamp TEXT, latitude REAL, longitude REAL, altitude_meters REAL,
+      distance_meters REAL, distance_source TEXT NOT NULL DEFAULT 'none',
+      heart_rate REAL, cadence REAL, power_watts REAL, speed_meters_per_second REAL,
+      source_payload_json TEXT, UNIQUE(activity_id, sequence)
+    );
+    INSERT INTO activity_streams_next
+      SELECT id, activity_id, sequence, timestamp, latitude, longitude,
+        altitude_meters, CASE WHEN distance_source = 'supplied' THEN distance_meters ELSE NULL END,
+        CASE WHEN distance_source = 'supplied' THEN 'supplied' ELSE 'none' END,
+        heart_rate, cadence, power_watts, speed_meters_per_second, source_payload_json
+      FROM activity_streams;
+    DROP TABLE activity_streams;
+    ALTER TABLE activity_streams_next RENAME TO activity_streams;
+    CREATE INDEX activity_streams_window ON activity_streams(activity_id, timestamp, distance_meters);
+
+    CREATE TABLE activity_bounds_next (
+      activity_id TEXT PRIMARY KEY REFERENCES activities(id), point_count INTEGER NOT NULL,
+      started_at TEXT, ended_at TEXT, min_latitude REAL, min_longitude REAL,
+      max_latitude REAL, max_longitude REAL, total_distance_meters REAL,
+      elevation_gain_meters REAL, has_location INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL, distance_source TEXT NOT NULL DEFAULT 'none'
+    );
+    INSERT INTO activity_bounds_next
+      SELECT activity_id, point_count, started_at, ended_at, min_latitude,
+        min_longitude, max_latitude, max_longitude,
+        CASE WHEN distance_source = 'supplied' THEN total_distance_meters ELSE NULL END,
+        elevation_gain_meters, has_location, updated_at,
+        CASE WHEN distance_source = 'supplied' THEN 'supplied' ELSE 'none' END
+      FROM activity_bounds;
+    DROP TABLE activity_bounds;
+    ALTER TABLE activity_bounds_next RENAME TO activity_bounds;
+
+    CREATE TABLE activity_distance_diagnostics (
+      activity_id TEXT PRIMARY KEY REFERENCES activities(id),
+      derivation_version INTEGER NOT NULL,
+      raw_gps_distance_meters REAL,
+      catalog_distance_meters REAL,
+      error_ratio REAL,
+      total_point_count INTEGER NOT NULL,
+      valid_coordinate_point_count INTEGER NOT NULL,
+      timestamped_point_count INTEGER NOT NULL,
+      major_gap_count INTEGER NOT NULL,
+      quality_status TEXT NOT NULL,
+      withheld_reason TEXT,
+      computed_at TEXT NOT NULL
+    );
+    CREATE INDEX activity_distance_diagnostics_quality
+      ON activity_distance_diagnostics(quality_status, derivation_version);
   `);
 }
 

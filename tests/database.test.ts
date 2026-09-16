@@ -29,7 +29,7 @@ describe("Database initialization", () => {
     const snapshots = second.prepare("SELECT count(*) AS count FROM export_snapshots").get() as { count: number };
     closeDatabase(second);
 
-    expect(version.version).toBe(9);
+    expect(version.version).toBe(11);
     expect(snapshots.count).toBe(1);
   });
 
@@ -73,6 +73,57 @@ describe("Database initialization", () => {
     expect(databaseMode).toBe(0o600);
     expect(dataDirMode).toBe(0o700);
     expect(process.umask()).toBe(0o077);
+  });
+
+  it("carries stream and bounds rows through the distance-provenance rebuild", async () => {
+    const dataDir = await temporaryDataDir();
+    const config = loadConfig({ STRAVA_MCP_DATA_DIR: dataDir });
+
+    // Seed at the pre-provenance version so the upgrade path runs for real:
+    // version ten adds the column, version eleven rebuilds both tables.
+    const seed = await openDatabase(config);
+    seed.prepare("INSERT INTO activities (id, sport_type, started_at) VALUES ('fit-1', 'Run', '2026-01-01T00:00:00.000Z')").run();
+    seed.prepare("INSERT INTO activities (id, sport_type, started_at) VALUES ('gpx-1', 'Run', '2026-01-02T00:00:00.000Z')").run();
+    const point = seed.prepare("INSERT INTO activity_streams (activity_id, sequence, timestamp, latitude, longitude, distance_meters) VALUES (?, ?, ?, ?, ?, ?)");
+    point.run("fit-1", 0, "2026-01-01T00:00:00.000Z", 37.1, -122.1, 0);
+    point.run("fit-1", 1, "2026-01-01T00:01:00.000Z", 37.2, -122.2, 250);
+    point.run("gpx-1", 0, "2026-01-02T00:00:00.000Z", 37.1, -122.1, null);
+    point.run("gpx-1", 1, "2026-01-02T00:01:00.000Z", 37.2, -122.2, null);
+    const bound = seed.prepare("INSERT INTO activity_bounds (activity_id, point_count, total_distance_meters, has_location, updated_at) VALUES (?, ?, ?, 1, '2026-01-01T00:00:00.000Z')");
+    bound.run("fit-1", 2, 250); bound.run("gpx-1", 2, null);
+    // Reshape to the version-nine layout rather than restating its DDL, so
+    // this test cannot drift from the schema the migrations actually build.
+    seed.exec(`
+      ALTER TABLE activity_streams DROP COLUMN distance_source;
+      ALTER TABLE activity_bounds DROP COLUMN distance_source;
+      DROP TABLE activity_distance_diagnostics;
+    `);
+    seed.prepare("UPDATE schema_version SET version = 9").run();
+    closeDatabase(seed);
+
+    const upgraded = await openDatabase(config);
+    const version = upgraded.prepare("SELECT version FROM schema_version LIMIT 1").get() as { version: number };
+    const streams = upgraded.prepare("SELECT activity_id AS activityId, sequence, distance_meters AS distanceMeters, distance_source AS distanceSource FROM activity_streams ORDER BY activity_id, sequence").all();
+    const bounds = upgraded.prepare("SELECT activity_id AS activityId, total_distance_meters AS totalDistanceMeters, distance_source AS distanceSource FROM activity_bounds ORDER BY activity_id").all();
+    const indexes = (upgraded.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('activity_streams', 'activity_bounds')").all() as { name: string }[]).map((row) => row.name);
+    const foreignKeyViolations = upgraded.pragma("foreign_key_check") as unknown[];
+    closeDatabase(upgraded);
+
+    expect(version.version).toBe(11);
+    // No row is dropped by the rebuild, and a distance the decoder supplied
+    // before provenance existed keeps both its value and its label.
+    expect(streams).toEqual([
+      { activityId: "fit-1", sequence: 0, distanceMeters: 0, distanceSource: "supplied" },
+      { activityId: "fit-1", sequence: 1, distanceMeters: 250, distanceSource: "supplied" },
+      { activityId: "gpx-1", sequence: 0, distanceMeters: null, distanceSource: "none" },
+      { activityId: "gpx-1", sequence: 1, distanceMeters: null, distanceSource: "none" },
+    ]);
+    expect(bounds).toEqual([
+      { activityId: "fit-1", totalDistanceMeters: 250, distanceSource: "supplied" },
+      { activityId: "gpx-1", totalDistanceMeters: null, distanceSource: "none" },
+    ]);
+    expect(indexes).toEqual(expect.arrayContaining(["activity_streams_window", "sqlite_autoindex_activity_streams_1", "sqlite_autoindex_activity_bounds_1"]));
+    expect(foreignKeyViolations).toEqual([]);
   });
 
   it("creates catalog provenance and incremental activity-state schema", async () => {

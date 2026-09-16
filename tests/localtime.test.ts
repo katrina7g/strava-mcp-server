@@ -59,7 +59,7 @@ async function importAll(fixture: Fixture, config: ServerConfig): Promise<Databa
 
 describe("UTC offset derivation", () => {
   it("derives a FIT offset from its local and UTC timestamps", () => {
-    const utc = new Date("2026-03-27T01:28:59Z");
+    const utc = new Date("2026-09-12T02:15:00Z");
     const local = (utc.valueOf() - 7 * 3_600_000) / 1000 - FIT_EPOCH_SECONDS;
 
     expect(fitOffsetMinutes({ timestamp: utc, localTimestamp: local })).toBe(-420);
@@ -86,8 +86,8 @@ describe("UTC offset derivation", () => {
 describe("Activity local time resolution", () => {
   it("prefers a decoded FIT offset over the configured zone", async () => {
     const fixture = await exportFixture(
-      "fit-1,\"Mar 27, 2026, 1:28:59 AM\",Night Run,Run,3600,6.2,activities/fit-1.fit,3500,10000,120",
-      { "fit-1.fit": syntheticFit(new Date("2026-03-27T01:28:59Z"), -420) },
+      "fit-1,\"Sep 12, 2026, 2:15:00 AM\",Night Run,Run,3600,6.2,activities/fit-1.fit,3500,10000,120",
+      { "fit-1.fit": syntheticFit(new Date("2026-09-12T02:15:00Z"), -420) },
     );
     const config = loadConfig({ STRAVA_EXPORT_DIR: fixture.exportDir, STRAVA_MCP_DATA_DIR: fixture.dataDir, STRAVA_MCP_TIMEZONE: "Europe/Berlin" });
     const database = await importAll(fixture, config);
@@ -95,8 +95,8 @@ describe("Activity local time resolution", () => {
     closeDatabase(database);
 
     expect(activity).toEqual({
-      startedAt: "2026-03-27T01:28:59.000Z",
-      startedAtLocal: "2026-03-26T18:28:59",
+      startedAt: "2026-09-12T02:15:00.000Z",
+      startedAtLocal: "2026-09-11T19:15:00",
       offset: -420,
       source: "fit-local-timestamp",
     });
@@ -104,20 +104,20 @@ describe("Activity local time resolution", () => {
 
   it("falls back to the configured zone when a source carries no offset", async () => {
     const fixture = await exportFixture(
-      "gpx-1,\"Mar 27, 2026, 1:28:59 AM\",Night Run,Run,3600,6.2,activities/gpx-1.gpx,3500,10000,120",
-      { "gpx-1.gpx": "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.77\" lon=\"-122.41\"><ele>10</ele><time>2026-03-27T01:28:59Z</time></trkpt></trkseg></trk></gpx>" },
+      "gpx-1,\"Sep 12, 2026, 2:15:00 AM\",Night Run,Run,3600,6.2,activities/gpx-1.gpx,3500,10000,120",
+      { "gpx-1.gpx": "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.77\" lon=\"-122.41\"><ele>10</ele><time>2026-09-12T02:15:00Z</time></trkpt></trkseg></trk></gpx>" },
     );
     const config = loadConfig({ STRAVA_EXPORT_DIR: fixture.exportDir, STRAVA_MCP_DATA_DIR: fixture.dataDir, STRAVA_MCP_TIMEZONE: "America/Los_Angeles" });
     const database = await importAll(fixture, config);
     const activity = database.prepare("SELECT started_at_local AS startedAtLocal, utc_offset_minutes AS offset, offset_source AS source FROM activities WHERE id = 'gpx-1'").get();
     closeDatabase(database);
 
-    expect(activity).toEqual({ startedAtLocal: "2026-03-26T18:28:59", offset: -420, source: "configured-zone" });
+    expect(activity).toEqual({ startedAtLocal: "2026-09-11T19:15:00", offset: -420, source: "configured-zone" });
   });
 
   it("reports no offset and groups in UTC when no source supplies one", async () => {
     const fixture = await exportFixture(
-      "gpx-1,\"Mar 27, 2026, 1:28:59 AM\",Night Run,Run,3600,6.2,activities/gpx-1.gpx,3500,10000,120",
+      "gpx-1,\"Sep 12, 2026, 2:15:00 AM\",Night Run,Run,3600,6.2,activities/gpx-1.gpx,3500,10000,120",
       { "gpx-1.gpx": "<gpx />" },
     );
     const config = loadConfig({ STRAVA_EXPORT_DIR: fixture.exportDir, STRAVA_MCP_DATA_DIR: fixture.dataDir });
@@ -125,15 +125,15 @@ describe("Activity local time resolution", () => {
     const activity = database.prepare("SELECT started_at_local AS startedAtLocal, utc_offset_minutes AS offset, offset_source AS source FROM activities WHERE id = 'gpx-1'").get();
     closeDatabase(database);
 
-    expect(activity).toEqual({ startedAtLocal: "2026-03-27T01:28:59", offset: null, source: "none" });
+    expect(activity).toEqual({ startedAtLocal: "2026-09-12T02:15:00", offset: null, source: "none" });
   });
 });
 
 describe("Time basis in grouped results", () => {
   it("groups an evening activity by its local day rather than its UTC day", async () => {
     const fixture = await exportFixture(
-      "fit-1,\"Mar 27, 2026, 1:28:59 AM\",Night Run,Run,3600,6.2,activities/fit-1.fit,3500,10000,120",
-      { "fit-1.fit": syntheticFit(new Date("2026-03-27T01:28:59Z"), -420) },
+      "fit-1,\"Sep 12, 2026, 2:15:00 AM\",Night Run,Run,3600,6.2,activities/fit-1.fit,3500,10000,120",
+      { "fit-1.fit": syntheticFit(new Date("2026-09-12T02:15:00Z"), -420) },
     );
     const config = loadConfig({ STRAVA_EXPORT_DIR: fixture.exportDir, STRAVA_MCP_DATA_DIR: fixture.dataDir });
     const server = createServer(config);
@@ -147,9 +147,9 @@ describe("Time basis in grouped results", () => {
     const utc = JSON.parse(textContent(await client.callTool({ name: "aggregate_training", arguments: { groupBy: "day", metrics: ["activityCount"], timeBasis: "utc" } })));
     await client.close();
 
-    expect(local.groups).toEqual([{ period: "2026-03-26", activityCount: 1 }]);
+    expect(local.groups).toEqual([{ period: "2026-09-11", activityCount: 1 }]);
     expect(local.timeBasis).toBe("local");
     expect(local.offsetCoverage).toMatchObject({ "fit-local-timestamp": 1 });
-    expect(utc.groups).toEqual([{ period: "2026-03-27", activityCount: 1 }]);
+    expect(utc.groups).toEqual([{ period: "2026-09-12", activityCount: 1 }]);
   });
 });

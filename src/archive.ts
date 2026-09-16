@@ -142,9 +142,10 @@ export function getActivity(database: Database, activityId: string): object {
   if (activity === undefined) return { found: false, activityId, message: "No imported activity matches this ID." };
 
   const files = database.prepare("SELECT relative_path AS relativePath, format, decode_status AS decodeStatus, parse_error AS parseError FROM activity_files WHERE activity_id = ? ORDER BY relative_path").all(activityId);
-  const bounds = database.prepare("SELECT point_count AS pointCount, started_at AS startedAt, ended_at AS endedAt, total_distance_meters AS streamDistanceMeters, elevation_gain_meters AS elevationGainMeters, has_location AS hasLocation FROM activity_bounds WHERE activity_id = ?").get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; elevationGainMeters: number | null; hasLocation: number } | undefined;
+  const bounds = database.prepare("SELECT point_count AS pointCount, started_at AS startedAt, ended_at AS endedAt, total_distance_meters AS streamDistanceMeters, distance_source AS streamDistanceSource, elevation_gain_meters AS elevationGainMeters, has_location AS hasLocation FROM activity_bounds WHERE activity_id = ?").get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; streamDistanceSource: "supplied" | "catalog-normalized-path" | "none"; elevationGainMeters: number | null; hasLocation: number } | undefined;
+  const distanceAnalysis = database.prepare("SELECT quality_status AS qualityStatus, withheld_reason AS withheldReason, derivation_version AS derivationVersion FROM activity_distance_diagnostics WHERE activity_id = ?").get(activityId);
   const laps = database.prepare("SELECT COUNT(*) AS count FROM activity_laps WHERE activity_id = ?").get(activityId) as { count: number };
-  const distance = resolveTotalDistance(bounds?.streamDistanceMeters ?? null, typeof activity.distanceMeters === "number" ? activity.distanceMeters : null);
+  const distance = resolveTotalDistance(bounds?.streamDistanceMeters ?? null, typeof activity.distanceMeters === "number" ? activity.distanceMeters : null, bounds?.streamDistanceSource ?? "none");
   const movingSeconds = activity.movingSeconds ?? activity.durationSeconds;
   const pace = typeof distance.meters === "number" && distance.meters > 0 && typeof movingSeconds === "number" ? (movingSeconds * 1000) / distance.meters : null;
 
@@ -163,6 +164,7 @@ export function getActivity(database: Database, activityId: string): object {
         imported: true, pointCount: bounds.pointCount, lapCount: laps.count,
         firstPointAt: bounds.startedAt, lastPointAt: bounds.endedAt,
         elevationGainMeters: bounds.elevationGainMeters, hasLocation: bounds.hasLocation === 1,
+        distanceAnalysis: distanceAnalysis ?? { qualityStatus: "unavailable", message: "No route-distance diagnostic has been computed." },
       },
     limitations: [
       "Coordinates are never returned by this tool; use get_activity_route with includeLocation.",

@@ -78,7 +78,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     {
       title: "Get activity stream", description: "Returns bounded imported telemetry. Coordinates are withheld unless includeLocation is explicitly true, and that opt-in applies only to the single request that sets it.",
       inputSchema: z.object({
-        activityId: z.string().trim().min(1), fields: z.array(z.enum(["timestamp", "altitudeMeters", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond", "latitude", "longitude"])).max(9).optional(),
+        activityId: z.string().trim().min(1), fields: z.array(z.enum(["timestamp", "altitudeMeters", "distanceMeters", "distanceSource", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond", "latitude", "longitude"])).max(10).optional(),
         includeLocation: z.boolean().default(false),
         maxPoints: z.number().int().min(1).max(MAX_STREAM_POINTS).optional(), startTime: optionalDate, endTime: optionalDate,
       }).refine((input) => input.startTime === undefined || input.endTime === undefined || input.startTime < input.endTime, { message: "startTime must be before endTime." }),

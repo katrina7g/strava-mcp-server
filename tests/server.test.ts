@@ -191,8 +191,8 @@ describe("MCP server tool surface", () => {
   it("serves get_activity with decode status, lap count, and no coordinates", async () => {
     const root = await temporaryDirectory(); const exportDir = join(root, "export");
     await mkdir(join(exportDir, "activities"), { recursive: true });
-    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n");
-    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.2\"><ele>15</ele><time>2026-01-01T18:01:00Z</time></trkpt></trkseg></trk></gpx>");
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.2224,activities/gpx-1.gpx,110,222.4,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.101\" lon=\"-122.1\"><ele>15</ele><time>2026-01-01T18:00:10Z</time></trkpt><trkpt lat=\"37.102\" lon=\"-122.1\"><ele>20</ele><time>2026-01-01T18:00:20Z</time></trkpt></trkseg></trk></gpx>");
     const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
     await client.callTool({ name: "import_activity_catalog", arguments: {} });
     await client.callTool({ name: "import_detailed_activities", arguments: {} });
@@ -201,11 +201,36 @@ describe("MCP server tool surface", () => {
 
     expect(activity).toMatchObject({ found: true, activity: { id: "gpx-1", sportType: "Run" } });
     expect(activity.files[0]).toMatchObject({ format: "gpx", decodeStatus: "decoded" });
-    expect(activity.telemetry).toMatchObject({ imported: true, pointCount: 2, lapCount: 0, hasLocation: true });
-    // GPX supplies no per-point distance, so the catalog total is used and labelled.
-    expect(activity.derived).toMatchObject({ totalDistanceMeters: 100, totalDistanceSource: "catalog" });
+    expect(activity.telemetry).toMatchObject({ imported: true, pointCount: 3, lapCount: 0, hasLocation: true });
+    expect(activity.derived.totalDistanceSource).toBe("catalog-normalized-path");
+    expect(activity.telemetry.distanceAnalysis).toMatchObject({ qualityStatus: "eligible" });
     expect(JSON.stringify(activity)).not.toContain("-122.1");
     expect(missing).toMatchObject({ found: false });
+    await client.close();
+  });
+
+  it("withholds distance analysis, with a coordinate-free reason, for an ineligible route", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-gap,Jan 1 2026 10:00:00 AM,Gapped Run,Run,600,11.2,activities/gpx-gap.gpx,600,11200,5\n");
+    // The third point jumps roughly eleven kilometres after a ten-minute
+    // silence, so route position between the two segments is unknowable.
+    await writeFile(join(exportDir, "activities", "gpx-gap.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.101\" lon=\"-122.1\"><ele>12</ele><time>2026-01-01T18:00:10Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.1\"><ele>15</ele><time>2026-01-01T18:10:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const activity = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-gap" } })));
+    const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-gap", fields: ["distanceMeters", "distanceSource"] } })));
+
+    expect(activity.telemetry.distanceAnalysis).toMatchObject({ qualityStatus: "ineligible", withheldReason: expect.stringContaining("discontinuity") });
+    // An ineligible route yields no per-point distance at all, so the catalog
+    // total is the only figure left and must be labelled as such.
+    expect(activity.derived).toMatchObject({ totalDistanceMeters: 11200, totalDistanceSource: "catalog" });
+    expect(stream.fieldAvailability.distanceMeters).toBe(0);
+    expect(stream.points.every((point: { distanceSource: string }) => point.distanceSource === "none")).toBe(true);
+    // The reason explains the rejection without disclosing where it happened.
+    expect(JSON.stringify(activity)).not.toContain("-122.1");
+    expect(JSON.stringify(activity)).not.toContain("37.2");
     await client.close();
   });
 
@@ -219,7 +244,7 @@ describe("MCP server tool surface", () => {
     await client.callTool({ name: "import_detailed_activities", arguments: {} });
     const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1", fields: ["heartRate", "distanceMeters"] } })));
 
-    // One of two points has heart rate; GPX never supplies distance.
+    // One of two points has heart rate; this route is too short to normalize.
     expect(stream.fieldAvailability).toEqual({ heartRate: 1, distanceMeters: 0 });
     await client.close();
   });

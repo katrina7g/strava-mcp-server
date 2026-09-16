@@ -34,7 +34,7 @@ describe("activity catalog normalization", () => {
 
   it("preserves duplicate headers positionally and parses canonical fields", () => {
     const map = buildPositionalColumnMap(headers);
-    const row = normalizeActivityCatalogRow(headers, ["42", "Jul 8, 2026, 1:05:36 AM", "12.68", "20414.8", "activities/42.fit.gz", "false"], 2);
+    const row = normalizeActivityCatalogRow(headers, ["42", "Feb 11, 2026, 4:22:08 AM", "12.68", "20414.8", "activities/42.fit.gz", "false"], 2);
 
     expect(ACTIVITY_CATALOG_COLUMN_MAP_VERSION).toBe(4);
     expect(map.map((column) => column.internalName)).toEqual(["activity_id", "activity_date", "distance", "distance__2", "filename", "commute"]);
@@ -54,8 +54,8 @@ describe("activity catalog normalization", () => {
   it("reads catalog timestamps as UTC regardless of the importing host's zone", () => {
     const startedAt = (value: string) => normalizeActivityCatalogRow(headers, ["42", value, "1", "1609.34", "", "false"], 2).parsedValues.startedAt;
 
-    // The reference export links this catalog value to a GPX `2026-03-27T01:28:59Z`.
-    expect(startedAt("Mar 27, 2026, 1:28:59 AM")).toBe("2026-03-27T01:28:59.000Z");
+    // A catalog value and its linked GPX describe the same instant.
+    expect(startedAt("Sep 12, 2026, 2:15:00 AM")).toBe("2026-09-12T02:15:00.000Z");
     expect(startedAt("Jan 1 2026 10:00:00 AM")).toBe("2026-01-01T10:00:00.000Z");
     expect(startedAt("Jul 8, 2026, 12:00:00 AM")).toBe("2026-07-08T00:00:00.000Z");
     expect(startedAt("Jul 8, 2026, 12:30:00 PM")).toBe("2026-07-08T12:30:00.000Z");
