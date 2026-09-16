@@ -7,6 +7,7 @@ import { SaxesParser } from "saxes";
 import type { Database } from "./database.js";
 import { elevationGainMeters } from "./elevation.js";
 import { normalizeRouteProgression, ROUTE_DISTANCE_DERIVATION_VERSION, type DistanceSource } from "./distance.js";
+import { deriveSplits, INTERVAL_METERS, SPLIT_DERIVATION_VERSION, type IntervalKind } from "./splits.js";
 import { logInternalError } from "./errors.js";
 import { simplifyToLimit } from "./geometry.js";
 import { fitOffsetMinutes, resolveActivityLocalTimes } from "./localtime.js";
@@ -162,7 +163,7 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
   const root = resolve(exportDir); const files = database.prepare(`
     SELECT f.id, f.activity_id AS activityId, f.relative_path AS relativePath,
       f.decode_status AS decodeStatus, f.decoded_sha256 AS decodedSha256,
-      f.decoder_version AS decoderVersion, f.distance_derivation_version AS derivationVersion,
+      f.decoder_version AS decoderVersion, f.distance_derivation_version AS derivationVersion, f.split_derivation_version AS splitVersion,
       a.distance_meters AS catalogDistanceMeters,
       (SELECT m.sha256 FROM source_manifest m
         WHERE m.relative_path = f.relative_path
@@ -170,7 +171,7 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
       ) AS currentSha256
     FROM activity_files f JOIN activities a ON a.id = f.activity_id
     WHERE f.activity_id IS NOT NULL ${activityId === undefined ? "" : "AND f.activity_id = ?"}
-  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; decodeStatus: string | null; decodedSha256: string | null; decoderVersion: number | null; derivationVersion: number | null; catalogDistanceMeters: number | null; currentSha256: string | null }[];
+  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; decodeStatus: string | null; decodedSha256: string | null; decoderVersion: number | null; derivationVersion: number | null; splitVersion: number | null; catalogDistanceMeters: number | null; currentSha256: string | null }[];
   // A file's detail row can outlive the source that produced it — an export
   // may drop a file between snapshots. Decoding only proceeds for paths the
   // latest validation actually observed, not merely ones once recorded.
@@ -193,7 +194,8 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
     // so the file is decoded rather than assumed current.
     const current = file.currentSha256;
     if (!force && file.decodeStatus === "decoded" && current !== null && file.decodedSha256 === current
-      && file.decoderVersion === DECODER_VERSION && file.derivationVersion === ROUTE_DISTANCE_DERIVATION_VERSION) {
+      && file.decoderVersion === DECODER_VERSION && file.derivationVersion === ROUTE_DISTANCE_DERIVATION_VERSION
+      && file.splitVersion === SPLIT_DERIVATION_VERSION) {
       results.push({ activityId: file.activityId, status: "unchanged" });
       continue;
     }
@@ -220,11 +222,20 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
         const gain = elevationGainMeters(altitudes, ELEVATION_NOISE_THRESHOLD_METERS);
         database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, distance_source, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, bounds.distanceSource, gain, bounds.minLatitude === null ? 0 : 1, now);
         database.prepare("INSERT OR REPLACE INTO activity_distance_diagnostics (activity_id, derivation_version, raw_gps_distance_meters, catalog_distance_meters, error_ratio, total_point_count, valid_coordinate_point_count, timestamped_point_count, major_gap_count, quality_status, withheld_reason, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, ROUTE_DISTANCE_DERIVATION_VERSION, route.diagnostic.rawGpsDistanceMeters, route.diagnostic.catalogDistanceMeters, route.diagnostic.errorRatio, route.diagnostic.totalPointCount, route.diagnostic.validCoordinatePointCount, route.diagnostic.timestampedPointCount, route.diagnostic.majorGapCount, route.diagnostic.qualityStatus, route.diagnostic.withheldReason, now);
-        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ?, decoded_sha256 = ?, decoder_version = ?, distance_derivation_version = ?, decoded_at = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, current, DECODER_VERSION, ROUTE_DISTANCE_DERIVATION_VERSION, now, file.id);
+        database.prepare("DELETE FROM activity_splits WHERE activity_id = ?").run(file.activityId);
+        const splitRow = database.prepare("INSERT INTO activity_splits (activity_id, interval_kind, interval_meters, sequence, derivation_version, distance_source, start_distance_meters, end_distance_meters, distance_meters, complete, started_at, ended_at, elapsed_seconds, moving_seconds, paused_seconds, pause_count, recording_gap_count, pace_seconds_per_km, average_heart_rate, max_heart_rate, average_cadence, average_power_watts, elevation_gain_meters, elevation_loss_meters, point_count, metrics_available_json, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        const streamSource = String(bounds.distanceSource) as DistanceSource;
+        for (const intervalKind of ["km", "mile"] as IntervalKind[]) {
+          const derived = deriveSplits(detailed.points, intervalKind, streamSource);
+          for (const split of derived.splits) {
+            splitRow.run(file.activityId, intervalKind, INTERVAL_METERS[intervalKind], split.sequence, SPLIT_DERIVATION_VERSION, streamSource, split.startDistanceMeters, split.endDistanceMeters, split.distanceMeters, split.complete ? 1 : 0, split.startedAt, split.endedAt, split.elapsedSeconds, split.movingSeconds, split.pausedSeconds, split.pauseCount, split.recordingGapCount, split.paceSecondsPerKm, split.averageHeartRate, split.maxHeartRate, split.averageCadence, split.averagePowerWatts, split.elevationGainMeters, split.elevationLossMeters, split.pointCount, JSON.stringify(split.metricsAvailable), now);
+          }
+        }
+        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ?, decoded_sha256 = ?, decoder_version = ?, distance_derivation_version = ?, split_derivation_version = ?, decoded_at = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, current, DECODER_VERSION, ROUTE_DISTANCE_DERIVATION_VERSION, SPLIT_DERIVATION_VERSION, now, file.id);
       }); write(); results.push({ activityId: file.activityId, status: "decoded", pointCount: detailed.points.length, lapCount: detailed.laps.length, utcOffsetMinutes: detailed.utcOffsetMinutes });
     } catch (error) {
       logInternalError(`decoding ${file.relativePath}`, error);
-      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ?, decoded_sha256 = NULL, decoder_version = NULL, distance_derivation_version = NULL WHERE id = ?").run("Detailed file could not be decoded", file.id);
+      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ?, decoded_sha256 = NULL, decoder_version = NULL, distance_derivation_version = NULL, split_derivation_version = NULL WHERE id = ?").run("Detailed file could not be decoded", file.id);
       results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" });
     }
   }

@@ -140,10 +140,14 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
   server.registerTool(
     "analyze_activity",
     {
-      title: "Analyze activity", description: "Provides catalog-level activity analysis. Split-based pacing and telemetry progression are not implemented; decoded telemetry is available through get_activity_stream and get_activity_route.",
-      inputSchema: z.object({ activityId: z.string().trim().min(1), analysisType: z.enum(["catalogSummary", "pace", "intensity"]).default("catalogSummary") }),
+      title: "Analyze activity", description: "Analyzes one activity from the catalog, or from decoded telemetry for the splits, progression, and pauses types. Telemetry analysis states whether its interval boundaries are file-supplied or catalog-normalized, and falls back to catalog-level analysis with a stated reason when no eligible route exists. Never returns coordinates.",
+      inputSchema: z.object({
+        activityId: z.string().trim().min(1),
+        analysisType: z.enum(["catalogSummary", "pace", "intensity", "splits", "progression", "pauses"]).default("catalogSummary"),
+        intervalKind: z.enum(["km", "mile"]).default("km"),
+      }),
     },
-    async ({ activityId, analysisType }) => withDatabase(config, "analyze_activity", (database) => analyzeActivity(database, activityId, analysisType)),
+    async ({ activityId, analysisType, intervalKind }) => withDatabase(config, "analyze_activity", (database) => analyzeActivity(database, activityId, analysisType, intervalKind)),
   );
 
   server.registerTool(

@@ -160,10 +160,11 @@ describe("MCP server tool surface", () => {
     expect(bests.results[0]).toMatchObject({ id: "run-2" });
     expect(activity.analysis.averagePaceSecondsPerKm).toBe(350);
     expect(activity.limitations[0]).toContain("Catalog-only analysis");
-    // Splits are unimplemented, not merely pending a detailed-format import.
-    expect(activity.limitations.join(" ")).toContain("not implemented");
-    expect(activity.limitations.join(" ")).not.toContain("until detailed");
-    expect(sports.capabilities.unavailable).toContain("not implemented");
+    // Catalog-level pace names the telemetry analysis that supersedes it,
+    // rather than describing splits as unavailable.
+    expect(activity.limitations.join(" ")).toContain("splits");
+    expect(activity.limitations.join(" ")).not.toContain("not implemented");
+    expect(sports.capabilities.unavailable).toContain("analyze_activity");
     expect(load).toMatchObject({ source: "supplied catalog Training Load", groups: [expect.objectContaining({ trainingLoad: 40 }), expect.objectContaining({ trainingLoad: 55 })] });
     await client.close();
   });
@@ -231,6 +232,61 @@ describe("MCP server tool surface", () => {
     // The reason explains the rejection without disclosing where it happened.
     expect(JSON.stringify(activity)).not.toContain("-122.1");
     expect(JSON.stringify(activity)).not.toContain("37.2");
+    await client.close();
+  });
+
+  it("serves splits, progression, and pauses from decoded telemetry", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    // 2.4 km of catalog distance over a straight track, so the route is
+    // eligible and normalization yields two whole splits and a partial one.
+    const points = Array.from({ length: 25 }, (_unused, index) => {
+      const time = new Date(Date.UTC(2026, 0, 1, 18, 0, 0) + index * 60_000).toISOString();
+      return `<trkpt lat="${(37 + index * 0.001).toFixed(3)}" lon="-122.1"><ele>${10 + index}</ele><time>${time}</time><extensions><gpxtpx:hr xmlns:gpxtpx="x">${140 + index}</gpxtpx:hr></extensions></trkpt>`;
+    }).join("");
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-splits,Jan 1 2026 10:00:00 AM,Split Run,Run,1440,2.4,activities/gpx-splits.gpx,1440,2400,20\n");
+    await writeFile(join(exportDir, "activities", "gpx-splits.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg>${points}</trkseg></trk></gpx>`);
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const splits = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "splits" } })));
+    const miles = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "splits", intervalKind: "mile" } })));
+    const progression = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "progression" } })));
+    const pauses = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "pauses" } })));
+
+    expect(splits).toMatchObject({ found: true, analysisType: "splits", distanceSource: "catalog-normalized-path", intervalKind: "km", intervalMeters: 1000 });
+    expect(splits.analysis.splits).toHaveLength(3);
+    expect(splits.analysis.splits.map((split: { complete: boolean }) => split.complete)).toEqual([true, true, false]);
+    // A normalized route must say so wherever a split is reported.
+    expect(splits.boundaryBasis).toContain("normalized to the catalog total");
+    expect(splits.analysis.splits[0].metricsAvailable).toContain("heartRate");
+    expect(miles).toMatchObject({ intervalKind: "mile", intervalMeters: 1609.344 });
+    expect(progression.analysis.series).toHaveLength(3);
+    expect(progression.analysis.paceDriftSecondsPerKm).toBeCloseTo(0, 3);
+    expect(pauses.analysis).toMatchObject({ totalPauseCount: 0, totalPausedSeconds: 0 });
+    expect(pauses.analysis.totalElapsedSeconds).toBeCloseTo(1440, 3);
+    expect(JSON.stringify(splits)).not.toContain("-122.1");
+    await client.close();
+  });
+
+  it("falls back to catalog analysis, with a reason, when no route is eligible", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-gap,Jan 1 2026 10:00:00 AM,Gapped Run,Run,600,11.2,activities/gpx-gap.gpx,600,11200,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-gap.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.101\" lon=\"-122.1\"><time>2026-01-01T18:00:10Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.1\"><time>2026-01-01T18:10:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const splits = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits-missing", analysisType: "splits" } })));
+    const ineligible = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-gap", analysisType: "splits" } })));
+
+    // An ineligible route is answered, not refused: the catalog figures stand
+    // and the reason for the missing interval view is stated without location.
+    expect(ineligible).toMatchObject({ found: true, fellBackToCatalog: true, distanceSource: "none", routeQualityStatus: "ineligible" });
+    expect(ineligible.reason).toContain("discontinuity");
+    expect(ineligible.analysis.distanceMeters).toBe(11200);
+    expect(JSON.stringify(ineligible)).not.toContain("-122.1");
+    expect(splits).toMatchObject({ found: false });
     await client.close();
   });
 

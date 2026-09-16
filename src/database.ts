@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 12;
+const LATEST_SCHEMA_VERSION = 13;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -79,6 +79,7 @@ function migrate(database: Database): void {
     if (currentVersion < 10) migrationTen(database);
     if (currentVersion < 11) migrationEleven(database);
     if (currentVersion < 12) migrationTwelve(database);
+    if (currentVersion < 13) migrationThirteen(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -454,6 +455,43 @@ function migrationTwelve(database: Database): void {
     ALTER TABLE activity_files ADD COLUMN decoder_version INTEGER;
     ALTER TABLE activity_files ADD COLUMN distance_derivation_version INTEGER;
     ALTER TABLE activity_files ADD COLUMN decoded_at TEXT;
+  `);
+}
+
+/** Splits are keyed by interval so kilometre and mile series coexist, and
+ * carry their own derivation version so a formula change is detectable
+ * independently of the decoder that produced the underlying stream. */
+function migrationThirteen(database: Database): void {
+  database.exec(`
+    ALTER TABLE activity_files ADD COLUMN split_derivation_version INTEGER;
+
+    CREATE TABLE activity_splits (
+      activity_id TEXT NOT NULL REFERENCES activities(id),
+      interval_kind TEXT NOT NULL,
+      interval_meters REAL NOT NULL,
+      sequence INTEGER NOT NULL,
+      derivation_version INTEGER NOT NULL,
+      distance_source TEXT NOT NULL,
+      start_distance_meters REAL NOT NULL,
+      end_distance_meters REAL NOT NULL,
+      distance_meters REAL NOT NULL,
+      complete INTEGER NOT NULL,
+      started_at TEXT, ended_at TEXT,
+      elapsed_seconds REAL, moving_seconds REAL,
+      paused_seconds REAL NOT NULL DEFAULT 0,
+      pause_count INTEGER NOT NULL DEFAULT 0,
+      recording_gap_count INTEGER NOT NULL DEFAULT 0,
+      pace_seconds_per_km REAL,
+      average_heart_rate REAL, max_heart_rate REAL,
+      average_cadence REAL, average_power_watts REAL,
+      elevation_gain_meters REAL, elevation_loss_meters REAL,
+      point_count INTEGER NOT NULL,
+      metrics_available_json TEXT NOT NULL,
+      computed_at TEXT NOT NULL,
+      PRIMARY KEY (activity_id, interval_kind, sequence)
+    );
+    CREATE INDEX activity_splits_lookup
+      ON activity_splits(activity_id, interval_kind, sequence);
   `);
 }
 
