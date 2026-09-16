@@ -11,6 +11,7 @@ import { guardTool, logInternalError, toolFailure, toolSuccess, type ToolResult 
 import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
 import { getGear, importGear } from "./gear.js";
 import { importMedia, listMedia } from "./media.js";
+import { getChallenges, getClubs, importCommunity } from "./community.js";
 import { MAX_GROUPS } from "./limits.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
@@ -197,13 +198,36 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_supporting_data",
     {
       title: "Import supporting data",
-      description: "Imports the export's supporting domains, currently gear and media references, into the local database. Reuses the latest validation snapshot and never changes the source export.",
+      description: "Imports the export's supporting domains, currently gear, media references, challenges, clubs and memberships, into the local database. Reuses the latest validation snapshot and never changes the source export.",
       inputSchema: z.object({}),
     },
     async () => withExport(config, "import_supporting_data", async (exportDir, database) => {
       const snapshotId = await latestSnapshotId(exportDir, database);
-      return { snapshotId, domains: [...await importGear(exportDir, database, snapshotId), ...await importMedia(exportDir, database, snapshotId)] };
+      return { snapshotId, domains: [...await importGear(exportDir, database, snapshotId), ...await importMedia(exportDir, database, snapshotId), ...await importCommunity(exportDir, database, snapshotId)] };
     }),
+  );
+
+  server.registerTool(
+    "get_challenges",
+    {
+      title: "Get challenges",
+      description: "Lists imported global and group challenges with join dates and completion, paginated.",
+      inputSchema: z.object({
+        scope: z.enum(["global", "group"]).optional(), completed: z.boolean().optional(),
+        page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+      }),
+    },
+    async (input) => withDatabase(config, "get_challenges", (database) => getChallenges(database, input)),
+  );
+
+  server.registerTool(
+    "get_clubs",
+    {
+      title: "Get clubs",
+      description: "Lists imported clubs and the account's memberships, paginated. A club named only by a membership is reported with its name alone.",
+      inputSchema: z.object({ page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional() }),
+    },
+    async (input) => withDatabase(config, "get_clubs", (database) => getClubs(database, input)),
   );
 
   server.registerTool(
@@ -242,7 +266,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
 
   server.registerTool(
     "get_data_schema",
-    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits", "media"]).optional() }) },
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits", "media", "challenges", "clubs"]).optional() }) },
     async ({ domain }) => withDatabase(config, "get_data_schema", (database) => getDataSchema(database, domain)),
   );
 

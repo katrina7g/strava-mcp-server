@@ -74,8 +74,8 @@ Call these three tools once, in order, through any connected MCP client:
 2. `import_activity_catalog` imports `activities.csv`. It prints a delta of
    inserted, changed, unchanged, and no-longer-observed activities.
 3. `import_supporting_data` imports gear, meaning shoes, bikes, and
-   components, plus media references, and links both to the activities that
-   reference them.
+   components, plus media references, challenges, clubs, and memberships,
+   linking each to the activities that reference it.
 
 Then, optionally:
 
@@ -194,7 +194,7 @@ when a cap is hit.
 | `get_server_info` | Server identity, version, and whether an export is configured. |
 | `validate_export` | Read-only structural check of the configured export. Records a snapshot; never modifies the export. |
 | `import_activity_catalog` | Imports `activities.csv`. Reports a new/changed/unchanged/no-longer-observed delta. |
-| `import_supporting_data` | Imports supporting domains, currently gear and media references, over the same delta contract. |
+| `import_supporting_data` | Imports supporting domains: gear, media references, challenges, clubs, and memberships, over the same delta contract. |
 | `import_detailed_activities` | Decodes GPX/FIT/`.fit.gz`/`.tcx.gz` files into streams, laps, bounds, and splits. Unchanged files are skipped; pass `force` to decode anyway. Per-file failures don't stop the rest. |
 
 **Archive and schema**
@@ -202,7 +202,7 @@ when a cap is hit.
 | Tool | Purpose |
 | --- | --- |
 | `get_archive_summary` | Coverage, sport counts, imported/empty/not-imported domains, and latest snapshot health. |
-| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain (`activities`, `gear`, `splits`, `media`). |
+| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain (`activities`, `gear`, `splits`, `media`, `challenges`, `clubs`). |
 
 **Activities**
 
@@ -231,6 +231,8 @@ when a cap is hit.
 | --- | --- |
 | `get_gear` | Imported gear with usage counts and distance, paginated. |
 | `list_media` | Imported media references with captions and activity links, paginated. Stores paths and captions only. |
+| `get_challenges` | Imported global and group challenges with join dates and completion, paginated. |
+| `get_clubs` | Imported clubs and the account's memberships, paginated. |
 
 **Resources**
 
@@ -400,8 +402,8 @@ npm rebuild better-sqlite3
   tool states the formula it used in its own response.
 - Unbounded raw-stream delivery, unrestricted SQL execution, or automatic
   EXIF location extraction.
-- Challenge, club, and social-summary import. These sources are validated and
-  checksummed but not parsed into queryable tables. `get_data_schema` and
-  `get_archive_summary` report them as not-imported rather than absent.
+- Social-summary import. Reactions and comments are validated and checksummed
+  but not parsed into queryable tables. `get_data_schema` and
+  `get_archive_summary` report the domain as not-imported rather than absent.
 - Reading media bytes or extracting EXIF. Media is referenced by path and
   caption only.

@@ -144,6 +144,12 @@ function parseExportDate(match: RegExpExecArray): string | null {
   return instant.getUTCMonth() === month && instant.getUTCDate() === day ? instant.toISOString() : null;
 }
 
+/** Exported so supporting domains parse the export's date format identically
+ * rather than each inventing their own. */
+export function parseExportTimestamp(value: string | undefined): string | null {
+  return parseDate(value);
+}
+
 function parseDate(value: string | undefined): string | null {
   const text = nullableText(value);
   if (text === null) return null;

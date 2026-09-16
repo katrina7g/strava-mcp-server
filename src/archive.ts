@@ -95,9 +95,28 @@ const MEDIA_FIELDS = [
   { name: "activityIds", type: "string[]", unit: null, privacy: "private" },
 ] as const;
 
+const CHALLENGE_FIELDS = [
+  { name: "scope", type: "string", unit: "global | group", privacy: "private" },
+  { name: "name", type: "string", unit: null, privacy: "private" },
+  { name: "joinedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "completed", type: "boolean", unit: null, privacy: "private" },
+] as const;
+
+const CLUB_FIELDS = [
+  { name: "name", type: "string", unit: null, privacy: "private" },
+  { name: "description", type: "string", unit: null, privacy: "private" },
+  { name: "clubType", type: "string", unit: null, privacy: "private" },
+  { name: "sport", type: "string", unit: null, privacy: "private" },
+  { name: "city", type: "string", unit: null, privacy: "private" },
+  { name: "state", type: "string", unit: null, privacy: "private" },
+  { name: "country", type: "string", unit: null, privacy: "private" },
+  { name: "website", type: "string", unit: null, privacy: "private" },
+  { name: "source", type: "string", unit: "club-file | membership-only", privacy: "private" },
+  { name: "joinedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "isMember", type: "boolean", unit: null, privacy: "private" },
+] as const;
+
 const NOT_IMPORTED_DOMAINS = [
-  { domain: "challenges", reason: "No query tool is implemented yet." },
-  { domain: "clubs", reason: "No query tool is implemented yet." },
   { domain: "social", reason: "No query tool is implemented yet. Reactions in an export are those the account gave, never those its activities received." },
   { domain: "profile-and-account", reason: "Profile, login, device, privacy-zone, preference, connected-app, contact, block, and flag sources are checksummed for change detection and never parsed." },
   { domain: "messaging", reason: "messaging.json is checksummed and never parsed." },
@@ -214,6 +233,15 @@ export function getDataSchema(database: Database, domain?: string): object {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
     ...(domain === undefined || domain === "gear" ? { gear: { fields: GEAR_FIELDS, currentState: "gear", queryTool: "get_gear" } } : {}),
+    ...(domain === undefined || domain === "challenges" ? {
+      challenges: { fields: CHALLENGE_FIELDS, currentState: "challenges", queryTool: "get_challenges" },
+    } : {}),
+    ...(domain === undefined || domain === "clubs" ? {
+      clubs: {
+        fields: CLUB_FIELDS, currentState: "clubs", memberships: "club_memberships", queryTool: "get_clubs",
+        note: "A club named only by a membership is stored with its name alone, since clubs.csv may be empty while memberships.csv is not.",
+      },
+    } : {}),
     ...(domain === undefined || domain === "media" ? {
       media: {
         fields: MEDIA_FIELDS, currentState: "media", links: "activity_media", queryTool: "list_media",

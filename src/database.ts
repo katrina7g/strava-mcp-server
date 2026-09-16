@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 14;
+const LATEST_SCHEMA_VERSION = 15;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -81,6 +81,7 @@ function migrate(database: Database): void {
     if (currentVersion < 12) migrationTwelve(database);
     if (currentVersion < 13) migrationThirteen(database);
     if (currentVersion < 14) migrationFourteen(database);
+    if (currentVersion < 15) migrationFifteen(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -525,6 +526,48 @@ function migrationFourteen(database: Database): void {
       PRIMARY KEY (activity_id, media_id)
     );
     CREATE INDEX activity_media_by_media ON activity_media(media_id);
+  `);
+}
+
+/** Challenges, clubs and memberships carry no identifier in the export, so
+ * each is keyed by its normalized name. A membership may name a club with no
+ * club record, which is normal when clubs.csv is empty, so the club row is
+ * synthesized and marked as known only through the membership. */
+function migrationFifteen(database: Database): void {
+  database.exec(`
+    CREATE TABLE challenges (
+      id TEXT PRIMARY KEY,
+      scope TEXT NOT NULL,
+      name TEXT NOT NULL,
+      joined_at TEXT,
+      completed INTEGER,
+      row_hash TEXT,
+      first_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      observation_status TEXT NOT NULL DEFAULT 'observed'
+    );
+    CREATE INDEX challenges_scope ON challenges(observation_status, scope, joined_at);
+
+    CREATE TABLE clubs (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT, club_type TEXT, sport TEXT,
+      city TEXT, state TEXT, country TEXT, website TEXT,
+      source TEXT NOT NULL,
+      row_hash TEXT,
+      first_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      observation_status TEXT NOT NULL DEFAULT 'observed'
+    );
+
+    CREATE TABLE club_memberships (
+      club_id TEXT PRIMARY KEY REFERENCES clubs(id),
+      joined_at TEXT,
+      row_hash TEXT,
+      first_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      observation_status TEXT NOT NULL DEFAULT 'observed'
+    );
   `);
 }
 
