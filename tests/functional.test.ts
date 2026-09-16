@@ -51,6 +51,21 @@ function syntheticFit(utc: Date): Uint8Array {
   return encoder.close();
 }
 
+/** A longer FIT track, so supplied distance spans whole split boundaries. */
+function syntheticFitTrack(utc: Date, seconds: number, metersPerSecond: number): Uint8Array {
+  const encoder = new Encoder();
+  encoder.writeMesg({ mesgNum: 0, type: "activity", manufacturer: "garmin", product: 1, timeCreated: utc, serialNumber: 1 });
+  for (let second = 0; second <= seconds; second += 1) {
+    encoder.writeMesg({
+      mesgNum: 20, timestamp: new Date(utc.valueOf() + second * 1_000),
+      positionLat: 450000000 + second * 1_000, positionLong: -1460000000,
+      distance: second * metersPerSecond, heartRate: 140, cadence: 85, altitude: 10 + (second % 20),
+    });
+  }
+  encoder.writeMesg({ mesgNum: 34, timestamp: utc, localTimestamp: utc.valueOf() / 1000 - 631_065_600, numSessions: 1, type: "manual", event: "activity", eventType: "stop" });
+  return encoder.close();
+}
+
 const CATALOG_HEADER = "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain";
 
 describe("Malformed export handling", () => {
@@ -273,5 +288,48 @@ describe("Privacy defaults across the tool surface", () => {
 
     expect(leaked).toEqual([]);
     expect(opted).toContain("47.637626");
+  });
+});
+
+describe("Telemetry analysis end to end", () => {
+  it("derives splits from file-supplied distance and labels them as recorded", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\nfit-splits,"Jan 3, 2026, 7:00:00 AM",FIT,Run,1200,2.4,activities/fit-splits.fit,1200,2400,10\n`);
+    // 2,400 m at 2 m/s: two whole kilometres and a partial third.
+    await writeFile(join(exportDir, "activities", "fit-splits.fit"), syntheticFitTrack(new Date("2026-01-03T15:00:00Z"), 1_200, 2));
+
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const splits = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "fit-splits", analysisType: "splits" } })));
+    const progression = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "fit-splits", analysisType: "progression" } })));
+    await client.close();
+
+    expect(splits).toMatchObject({ found: true, distanceSource: "supplied", intervalKind: "km" });
+    // Supplied distance is used as recorded, never normalized to the catalog.
+    expect(splits.boundaryBasis).toContain("recorded");
+    expect(splits.boundaryBasis).not.toContain("normalized");
+    expect(splits.analysis.splits).toHaveLength(3);
+    expect(splits.analysis.splits[0]).toMatchObject({ complete: true, distanceMeters: 1_000 });
+    expect(splits.analysis.splits[0].paceSecondsPerKm).toBeCloseTo(500, 0);
+    expect(splits.analysis.splits[0].metricsAvailable).toEqual(expect.arrayContaining(["heartRate", "cadence", "elevation"]));
+    // Steady pace throughout, so the first and last complete splits match.
+    expect(progression.analysis.paceDriftSecondsPerKm).toBeCloseTo(0, 0);
+  });
+
+  it("publishes the split domain through the data schema", async () => {
+    const { exportDir, dataDir } = await copiedFixture("minimal-export");
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: dataDir }));
+    const schema = JSON.parse(textContent(await client.callTool({ name: "get_data_schema", arguments: { domain: "splits" } })));
+    await client.close();
+
+    expect(schema.splits).toMatchObject({ currentState: "activity_splits", queryTool: "analyze_activity", intervals: ["km", "mile"] });
+    const names = schema.splits.fields.map((field: { name: string }) => field.name);
+    expect(names).toEqual(expect.arrayContaining(["paceSecondsPerKm", "pausedSeconds", "recordingGapCount", "distanceSource", "metricsAvailable"]));
+    // A split is a derived metric, never a place.
+    expect(names).not.toContain("latitude");
+    expect(names).not.toContain("longitude");
   });
 });

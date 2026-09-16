@@ -61,6 +61,31 @@ const GEAR_FIELDS = [
  * into a queryable table. Naming them keeps a client from inferring that a
  * domain is absent from the export when it is merely not imported.
  */
+const SPLIT_FIELDS = [
+  { name: "sequence", type: "number", unit: "index", privacy: "private" },
+  { name: "startDistanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "endDistanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "distanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "complete", type: "boolean", unit: null, privacy: "private" },
+  { name: "startedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "endedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "elapsedSeconds", type: "number", unit: "seconds", privacy: "private" },
+  { name: "movingSeconds", type: "number", unit: "seconds", privacy: "private" },
+  { name: "pausedSeconds", type: "number", unit: "seconds", privacy: "private" },
+  { name: "pauseCount", type: "number", unit: "pauses", privacy: "private" },
+  { name: "recordingGapCount", type: "number", unit: "gaps", privacy: "private" },
+  { name: "paceSecondsPerKm", type: "number", unit: "seconds per kilometre", privacy: "private" },
+  { name: "averageHeartRate", type: "number", unit: "bpm", privacy: "private" },
+  { name: "maxHeartRate", type: "number", unit: "bpm", privacy: "private" },
+  { name: "averageCadence", type: "number", unit: "rpm", privacy: "private" },
+  { name: "averagePowerWatts", type: "number", unit: "watts", privacy: "private" },
+  { name: "elevationGainMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "elevationLossMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "pointCount", type: "number", unit: "points", privacy: "private" },
+  { name: "metricsAvailable", type: "string[]", unit: null, privacy: "private" },
+  { name: "distanceSource", type: "string", unit: "supplied | catalog-normalized-path | none", privacy: "private" },
+] as const;
+
 const NOT_IMPORTED_DOMAINS = [
   { domain: "media", reason: "No query tool is implemented yet; references are validated but not imported." },
   { domain: "challenges", reason: "No query tool is implemented yet." },
@@ -181,6 +206,13 @@ export function getDataSchema(database: Database, domain?: string): object {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
     ...(domain === undefined || domain === "gear" ? { gear: { fields: GEAR_FIELDS, currentState: "gear", queryTool: "get_gear" } } : {}),
+    ...(domain === undefined || domain === "splits" ? {
+      splits: {
+        fields: SPLIT_FIELDS, currentState: "activity_splits", queryTool: "analyze_activity",
+        intervals: ["km", "mile"],
+        note: "Splits exist only where a distance source supports interval boundaries: distance the file supplied, or a route eligible for normalization to the catalog total. distanceSource states which, and no split carries a coordinate.",
+      },
+    } : {}),
     notImported: NOT_IMPORTED_DOMAINS,
     sourceColumnMap: latestMap === undefined ? null : { mapVersion: latestMap.mapVersion, columns: JSON.parse(latestMap.columns) },
     note: "Direct identifiers and raw source values are not exposed by activity query tools. Exact coordinates are withheld unless a request to get_activity_route or get_activity_stream sets includeLocation to true.",

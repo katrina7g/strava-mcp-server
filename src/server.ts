@@ -226,7 +226,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
 
   server.registerTool(
     "get_data_schema",
-    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear"]).optional() }) },
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits"]).optional() }) },
     async ({ domain }) => withDatabase(config, "get_data_schema", (database) => getDataSchema(database, domain)),
   );
 

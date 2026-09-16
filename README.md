@@ -164,14 +164,14 @@ when a cap is hit.
 | `validate_export` | Read-only structural check of the configured export. Records a snapshot; never modifies the export. |
 | `import_activity_catalog` | Imports `activities.csv`. Reports a new/changed/unchanged/no-longer-observed delta. |
 | `import_supporting_data` | Imports supporting domains, currently gear only, over the same delta contract. |
-| `import_detailed_activities` | Decodes GPX/FIT/`.fit.gz`/`.tcx.gz` files into streams, laps, and bounds. Per-file failures don't stop the rest. |
+| `import_detailed_activities` | Decodes GPX/FIT/`.fit.gz`/`.tcx.gz` files into streams, laps, bounds, and splits. Unchanged files are skipped; pass `force` to decode anyway. Per-file failures don't stop the rest. |
 
 **Archive and schema**
 
 | Tool | Purpose |
 | --- | --- |
 | `get_archive_summary` | Coverage, sport counts, imported/empty/not-imported domains, and latest snapshot health. |
-| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain. |
+| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain (`activities`, `gear`, `splits`). |
 
 **Activities**
 
@@ -180,9 +180,9 @@ when a cap is hit.
 | `search_activities` | Filter by sport, date range, distance, duration, effort, or text; paginated. |
 | `aggregate_training` | Volume/duration/elevation/effort totals grouped by day, week, month, or sport. |
 | `get_activity` | One activity's catalog metadata, derived metrics, file/decode status, and telemetry availability. Never returns coordinates. |
-| `get_activity_stream` | Bounded telemetry points. Coordinates require `includeLocation: true` on that request. |
+| `get_activity_stream` | Bounded telemetry points, each with its `distanceSource`. Coordinates require `includeLocation: true` on that request. |
 | `get_activity_route` | Simplified route as GeoJSON, or a non-coordinate summary. Also requires `includeLocation: true` for geometry. |
-| `analyze_activity` | Catalog-level pace/intensity analysis with its limitations stated explicitly. |
+| `analyze_activity` | Catalog-level pace/intensity analysis, plus `splits`, `progression`, and `pauses` from decoded telemetry over 1 km or 1 mile intervals. Falls back to the catalog answer, with a reason, when no eligible route exists. |
 
 **Training analysis**
 
@@ -269,6 +269,36 @@ The local offset comes from, in order:
 Pass `timeBasis: "utc"` to any of the three grouping tools to bypass local
 time and group by UTC calendar boundaries instead.
 
+## Distance, splits, and what they are derived from
+
+Two thirds of a typical export carries no per-point distance at all, so a
+split boundary cannot always be measured. Each activity therefore states where
+its distance came from, and tools that depend on it say so in their responses.
+
+- **`supplied`** — the file recorded distance per point. FIT and some TCX
+  files do. This is used exactly as recorded.
+- **`catalog-normalized-path`** — a GPX or TCX route with no recorded
+  distance, whose cumulative position was scaled to the total distance the
+  activity catalog reports. The route decides *where* progress happened; the
+  catalog decides *how far*. This is not a measured odometer, and every
+  response built on it says so.
+- **`none`** — neither is available, so no splits are derived and the reason
+  is reported instead of a fabricated number.
+
+Normalization is only applied to a route that passes continuity checks: enough
+valid coordinates and timestamps, no discontinuity large enough to make
+position ambiguous, and a bounded difference between the raw GPS length and
+the catalog total. A route that fails any check is reported as ineligible with
+the reason, without coordinates. Raw GPS length and its error against the
+catalog are kept as internal diagnostics and are never used as a split basis.
+
+`analyze_activity` derives 1 km and 1 mile splits from that distance, with
+pace, heart rate, cadence, power, and separated elevation gain and loss. Each
+split lists the metrics it actually carries, so an absent metric is never read
+as a zero. A pause is movement below 0.5 m/s; a gap of more than 30 seconds
+that still covers ground is a hole in the recording rather than a rest, and is
+counted separately as `recordingGapCount`.
+
 ## Data and Git hygiene
 
 Do not commit a real Strava export, a generated database, an API credential,
@@ -324,9 +354,6 @@ npm rebuild better-sqlite3
   tool states the formula it used in its own response.
 - Unbounded raw-stream delivery, unrestricted SQL execution, or automatic
   EXIF location extraction.
-- Split-based pacing, telemetry progression, and per-split analysis. Device
-  coverage for the underlying data is too uneven across activities to support
-  these reliably at this time.
 - Media, challenge, club, and social-summary import. These sources are
   validated, and media is also checksummed, but none of them are parsed into
   queryable tables. `get_data_schema` and `get_archive_summary` report them as
