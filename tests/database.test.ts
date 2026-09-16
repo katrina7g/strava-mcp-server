@@ -29,7 +29,7 @@ describe("Database initialization", () => {
     const snapshots = second.prepare("SELECT count(*) AS count FROM export_snapshots").get() as { count: number };
     closeDatabase(second);
 
-    expect(version.version).toBe(11);
+    expect(version.version).toBe(12);
     expect(snapshots.count).toBe(1);
   });
 
@@ -75,6 +75,24 @@ describe("Database initialization", () => {
     expect(process.umask()).toBe(0o077);
   });
 
+  it("prepares a data directory once instead of on every connection", async () => {
+    if (process.platform === "win32") return;
+    const dataDir = await temporaryDataDir();
+    const config = loadConfig({ STRAVA_MCP_DATA_DIR: dataDir });
+
+    const first = await openDatabase(config);
+    closeDatabase(first);
+
+    // Opening a connection must not reach back into process-wide state. The
+    // umask is restored afterwards so neighbouring tests see their own value.
+    const original = process.umask(0o022);
+    try {
+      const second = await openDatabase(config);
+      closeDatabase(second);
+      expect(process.umask()).toBe(0o022);
+    } finally { process.umask(original); }
+  });
+
   it("carries stream and bounds rows through the distance-provenance rebuild", async () => {
     const dataDir = await temporaryDataDir();
     const config = loadConfig({ STRAVA_MCP_DATA_DIR: dataDir });
@@ -96,6 +114,10 @@ describe("Database initialization", () => {
     seed.exec(`
       ALTER TABLE activity_streams DROP COLUMN distance_source;
       ALTER TABLE activity_bounds DROP COLUMN distance_source;
+      ALTER TABLE activity_files DROP COLUMN decoded_sha256;
+      ALTER TABLE activity_files DROP COLUMN decoder_version;
+      ALTER TABLE activity_files DROP COLUMN distance_derivation_version;
+      ALTER TABLE activity_files DROP COLUMN decoded_at;
       DROP TABLE activity_distance_diagnostics;
     `);
     seed.prepare("UPDATE schema_version SET version = 9").run();
@@ -109,7 +131,7 @@ describe("Database initialization", () => {
     const foreignKeyViolations = upgraded.pragma("foreign_key_check") as unknown[];
     closeDatabase(upgraded);
 
-    expect(version.version).toBe(11);
+    expect(version.version).toBe(12);
     // No row is dropped by the rebuild, and a distance the decoder supplied
     // before provenance existed keeps both its value and its label.
     expect(streams).toEqual([

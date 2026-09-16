@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { Encoder } from "@garmin/fitsdk";
+import Sqlite from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
@@ -119,6 +120,78 @@ describe("Detailed import resilience", () => {
     expect(byId["broken-1"]).toMatchObject({ status: "failed" });
     // The failure is reported without the decoder's raw message.
     expect(byId["broken-1"].error).toBe("Detailed file could not be decoded");
+  });
+
+  it("leaves an unchanged file alone on re-import and re-decodes only on demand", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\ngpx-1,"Jan 2, 2026, 7:00:00 AM",GPX,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n`);
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.2" lon="-122.2"><time>2026-01-02T15:01:00Z</time></trkpt></trkseg></trk></gpx>`);
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const first = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const second = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const forced = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: { force: true } })));
+    await client.close();
+
+    expect(first).toMatchObject({ decoded: 1, unchanged: 0 });
+    // The bytes and both versions are identical, so there is nothing to redo.
+    expect(second).toMatchObject({ decoded: 0, unchanged: 1 });
+    expect(forced).toMatchObject({ decoded: 1, unchanged: 0 });
+  });
+
+  it("re-decodes a file whose bytes changed since the last import", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\ngpx-1,"Jan 2, 2026, 7:00:00 AM",GPX,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n`);
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt></trkseg></trk></gpx>`);
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    // A fresh export of the same activity, with one more recorded point.
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.2" lon="-122.2"><time>2026-01-02T15:01:00Z</time></trkpt></trkseg></trk></gpx>`);
+    await client.callTool({ name: "validate_export", arguments: {} });
+    const reimported = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1" } })));
+    await client.close();
+
+    expect(reimported).toMatchObject({ decoded: 1, unchanged: 0 });
+    expect(stream.totalPoints).toBe(2);
+  });
+
+  it("recomputes only the records a derivation-version bump affects", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export"); const dataDir = join(root, "cache");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    const rows = [
+      `gpx-1,"Jan 2, 2026, 7:00:00 AM",One,Run,120,0.1,activities/gpx-1.gpx,110,100,5`,
+      `gpx-2,"Jan 3, 2026, 7:00:00 AM",Two,Run,120,0.1,activities/gpx-2.gpx,110,100,5`,
+    ].join("\n");
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\n${rows}\n`);
+    const track = `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.2" lon="-122.2"><time>2026-01-02T15:01:00Z</time></trkpt></trkseg></trk></gpx>`;
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), track);
+    await writeFile(join(exportDir, "activities", "gpx-2.gpx"), track.replace("37.2", "37.3"));
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: dataDir }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    await client.close();
+
+    // Stand in for a formula change by ageing one activity's stored version,
+    // which is exactly what a bumped constant does to every stored row.
+    const raw = new Sqlite(join(dataDir, "strava.sqlite"));
+    raw.prepare("UPDATE activity_files SET distance_derivation_version = 0 WHERE activity_id = 'gpx-1'").run();
+    raw.close();
+
+    const reconnected = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: dataDir }));
+    const recomputed = JSON.parse(textContent(await reconnected.callTool({ name: "import_detailed_activities", arguments: {} })));
+    await reconnected.close();
+
+    const byId = Object.fromEntries(recomputed.results.map((result: { activityId: string }) => [result.activityId, result]));
+    expect(recomputed).toMatchObject({ decoded: 1, unchanged: 1 });
+    expect(byId["gpx-1"]).toMatchObject({ status: "decoded" });
+    expect(byId["gpx-2"]).toMatchObject({ status: "unchanged" });
   });
 
   it("re-imports detailed files without duplicating stream points", async () => {

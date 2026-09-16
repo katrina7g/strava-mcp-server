@@ -67,10 +67,10 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_detailed_activities",
     {
       title: "Import detailed activities",
-      description: "Decodes linked GPX, FIT, compressed FIT, and compressed TCX files into the local database. Source files are never changed; per-file failures do not stop the remaining import.",
-      inputSchema: z.object({ activityId: z.string().trim().min(1).optional() }),
+      description: "Decodes linked GPX, FIT, compressed FIT, and compressed TCX files into the local database. A file whose bytes and derivation versions are unchanged since its last successful decode is reported as unchanged rather than decoded again; pass force to decode regardless. Source files are never changed; per-file failures do not stop the remaining import.",
+      inputSchema: z.object({ activityId: z.string().trim().min(1).optional(), force: z.boolean().default(false) }),
     },
-    async ({ activityId }) => withExport(config, "import_detailed_activities", (exportDir, database) => importDetailedActivityFiles(exportDir, database, activityId, config.timeZone)),
+    async ({ activityId, force }) => withExport(config, "import_detailed_activities", (exportDir, database) => importDetailedActivityFiles(exportDir, database, activityId, config.timeZone, force)),
   );
 
   server.registerTool(

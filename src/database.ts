@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 11;
+const LATEST_SCHEMA_VERSION = 12;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -19,26 +19,44 @@ function applySidecarPermissions(databasePath: string): Promise<void[]> {
   return Promise.all(SIDECAR_SUFFIXES.map((suffix) => applyPrivatePermissions(`${databasePath}${suffix}`)));
 }
 
-export async function openDatabase(config: ServerConfig): Promise<Database> {
+/**
+ * A tool call opens and closes its own connection, so nothing holds a lock
+ * while the server is idle. Preparing the directory is not per-connection
+ * work, though: it mutates process-wide state and touches the filesystem, so
+ * it runs once per data directory per process rather than on every call.
+ */
+const preparedDataDirs = new Set<string>();
+
+async function prepareDataDir(dataDir: string): Promise<void> {
+  if (preparedDataDirs.has(dataDir)) return;
   // SQLite's rollback-journal/WAL/SHM sidecars are created by the native
   // driver directly, so we cannot chmod them until after they exist. Setting
   // a restrictive umask before any file in this data directory is created
   // closes that window; the process only ever writes here.
   process.umask(0o077);
-  await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  await chmod(config.dataDir, 0o700).catch(() => undefined);
+  await mkdir(dataDir, { recursive: true, mode: 0o700 });
+  await chmod(dataDir, 0o700).catch(() => undefined);
+  preparedDataDirs.add(dataDir);
+}
+
+export async function openDatabase(config: ServerConfig): Promise<Database> {
+  await prepareDataDir(config.dataDir);
 
   const databasePath = join(config.dataDir, DATABASE_FILE);
   const database = new Sqlite(databasePath);
   database.pragma("foreign_keys = ON");
   await applyPrivatePermissions(databasePath);
+  // The version read stays on every open. It is one row from a one-row table,
+  // and it is the check that refuses a database written by a newer server, so
+  // caching it would trade a real safety property for nothing measurable.
   migrate(database);
   await applySidecarPermissions(databasePath);
   return database;
 }
 
 function migrate(database: Database): void {
-  database.exec("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)");
+  const existing = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'").get();
+  if (existing === undefined) database.exec("CREATE TABLE schema_version (version INTEGER NOT NULL)");
   const row = database.prepare("SELECT version FROM schema_version LIMIT 1").get() as
     | { version: number }
     | undefined;
@@ -60,6 +78,7 @@ function migrate(database: Database): void {
     if (currentVersion < 9) migrationNine(database);
     if (currentVersion < 10) migrationTen(database);
     if (currentVersion < 11) migrationEleven(database);
+    if (currentVersion < 12) migrationTwelve(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -421,6 +440,20 @@ function migrationEleven(database: Database): void {
     );
     CREATE INDEX activity_distance_diagnostics_quality
       ON activity_distance_diagnostics(quality_status, derivation_version);
+  `);
+}
+
+/** Decoding is the slowest import step, so a file records what produced its
+ * current rows: the bytes it was decoded from and the decoder and derivation
+ * versions in force at the time. A later run re-decodes only where one of
+ * those three differs, which is also what makes a formula change recompute
+ * exactly the affected activities and nothing else. */
+function migrationTwelve(database: Database): void {
+  database.exec(`
+    ALTER TABLE activity_files ADD COLUMN decoded_sha256 TEXT;
+    ALTER TABLE activity_files ADD COLUMN decoder_version INTEGER;
+    ALTER TABLE activity_files ADD COLUMN distance_derivation_version INTEGER;
+    ALTER TABLE activity_files ADD COLUMN decoded_at TEXT;
   `);
 }
 

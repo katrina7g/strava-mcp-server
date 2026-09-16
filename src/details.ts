@@ -154,14 +154,23 @@ async function decode(path: string, format: DetailedActivity["format"]): Promise
 // figure. See elevation.ts for why this is a hysteresis band, not a
 // per-step gate.
 const ELEVATION_NOISE_THRESHOLD_METERS = 1;
+/** Bump when decoding changes what a file produces, so stored rows are known
+ * to be stale even though the source bytes are identical. */
+export const DECODER_VERSION = 1;
 
-export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string, timeZone?: string): Promise<object> {
+export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string, timeZone?: string, force = false): Promise<object> {
   const root = resolve(exportDir); const files = database.prepare(`
     SELECT f.id, f.activity_id AS activityId, f.relative_path AS relativePath,
-      a.distance_meters AS catalogDistanceMeters
+      f.decode_status AS decodeStatus, f.decoded_sha256 AS decodedSha256,
+      f.decoder_version AS decoderVersion, f.distance_derivation_version AS derivationVersion,
+      a.distance_meters AS catalogDistanceMeters,
+      (SELECT m.sha256 FROM source_manifest m
+        WHERE m.relative_path = f.relative_path
+          AND m.snapshot_id = (SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1)
+      ) AS currentSha256
     FROM activity_files f JOIN activities a ON a.id = f.activity_id
     WHERE f.activity_id IS NOT NULL ${activityId === undefined ? "" : "AND f.activity_id = ?"}
-  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; catalogDistanceMeters: number | null }[];
+  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; decodeStatus: string | null; decodedSha256: string | null; decoderVersion: number | null; derivationVersion: number | null; catalogDistanceMeters: number | null; currentSha256: string | null }[];
   // A file's detail row can outlive the source that produced it — an export
   // may drop a file between snapshots. Decoding only proceeds for paths the
   // latest validation actually observed, not merely ones once recorded.
@@ -169,7 +178,7 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
     SELECT relative_path AS relativePath FROM source_manifest
     WHERE snapshot_id = (SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1)
   `).all() as { relativePath: string }[]).map((row) => row.relativePath));
-  const results: { activityId: string; status: "decoded" | "skipped" | "failed"; pointCount?: number; lapCount?: number; utcOffsetMinutes?: number | null; error?: string }[] = [];
+  const results: { activityId: string; status: "decoded" | "unchanged" | "skipped" | "failed"; pointCount?: number; lapCount?: number; utcOffsetMinutes?: number | null; error?: string }[] = [];
   for (const file of files) {
     const format = formatFor(file.relativePath); const path = resolve(root, file.relativePath);
     // Decode status and the decoded offset are facts about one file, so every
@@ -177,6 +186,15 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
     if (format === null || !withinRoot(root, path) || !observedPaths.has(file.relativePath)) {
       database.prepare("UPDATE activity_files SET decode_status = ?, parse_error = ? WHERE id = ?").run("skipped", "Unsupported, unsafe, or unvalidated detailed file reference", file.id);
       results.push({ activityId: file.activityId, status: "skipped" });
+      continue;
+    }
+    // Re-decoding identical bytes under unchanged formulas would rewrite the
+    // same rows. A null checksum on either side means provenance is unknown,
+    // so the file is decoded rather than assumed current.
+    const current = file.currentSha256;
+    if (!force && file.decodeStatus === "decoded" && current !== null && file.decodedSha256 === current
+      && file.decoderVersion === DECODER_VERSION && file.derivationVersion === ROUTE_DISTANCE_DERIVATION_VERSION) {
+      results.push({ activityId: file.activityId, status: "unchanged" });
       continue;
     }
     try {
@@ -202,17 +220,17 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
         const gain = elevationGainMeters(altitudes, ELEVATION_NOISE_THRESHOLD_METERS);
         database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, distance_source, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, bounds.distanceSource, gain, bounds.minLatitude === null ? 0 : 1, now);
         database.prepare("INSERT OR REPLACE INTO activity_distance_diagnostics (activity_id, derivation_version, raw_gps_distance_meters, catalog_distance_meters, error_ratio, total_point_count, valid_coordinate_point_count, timestamped_point_count, major_gap_count, quality_status, withheld_reason, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, ROUTE_DISTANCE_DERIVATION_VERSION, route.diagnostic.rawGpsDistanceMeters, route.diagnostic.catalogDistanceMeters, route.diagnostic.errorRatio, route.diagnostic.totalPointCount, route.diagnostic.validCoordinatePointCount, route.diagnostic.timestampedPointCount, route.diagnostic.majorGapCount, route.diagnostic.qualityStatus, route.diagnostic.withheldReason, now);
-        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, file.id);
+        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ?, decoded_sha256 = ?, decoder_version = ?, distance_derivation_version = ?, decoded_at = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, current, DECODER_VERSION, ROUTE_DISTANCE_DERIVATION_VERSION, now, file.id);
       }); write(); results.push({ activityId: file.activityId, status: "decoded", pointCount: detailed.points.length, lapCount: detailed.laps.length, utcOffsetMinutes: detailed.utcOffsetMinutes });
     } catch (error) {
       logInternalError(`decoding ${file.relativePath}`, error);
-      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ? WHERE id = ?").run("Detailed file could not be decoded", file.id);
+      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ?, decoded_sha256 = NULL, decoder_version = NULL, distance_derivation_version = NULL WHERE id = ?").run("Detailed file could not be decoded", file.id);
       results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" });
     }
   }
   // A newly decoded FIT offset supersedes the configured-zone fallback.
   const coverage = resolveActivityLocalTimes(database, timeZone);
-  return { decoded: results.filter((result) => result.status === "decoded").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, offsetCoverage: coverage, results };
+  return { decoded: results.filter((result) => result.status === "decoded").length, unchanged: results.filter((result) => result.status === "unchanged").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, offsetCoverage: coverage, results };
 }
 
 /**
