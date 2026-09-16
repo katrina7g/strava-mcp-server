@@ -148,7 +148,37 @@ the export is readable before importing.
 | `npm run start` | Run the compiled stdio server. |
 | `npm run typecheck` | Typecheck production and test TypeScript. |
 | `npm test` | Run the test suite once. |
+| `npm run test:unit` | Pure derivation and parsing tests, no database. |
+| `npm run test:integration` | Database-backed import and query tests. |
+| `npm run test:functional` | Tests driving the real MCP tool surface. |
 | `npm run test:watch` | Run tests in watch mode. |
+| `npm run bench` | Build, then measure import cost against `STRAVA_EXPORT_DIR`. |
+
+## Performance
+
+`npm run bench` builds and then imports the export named by
+`STRAVA_EXPORT_DIR` into a temporary data directory, reporting per-phase wall
+time, rows written, database size, and peak resident memory as JSON. It never
+touches the configured `STRAVA_MCP_DATA_DIR` unless you pass `--reuse`.
+
+Rough shape on a mid-size export of a few hundred activities, Node 24 on
+darwin-arm64. Run it against your own export for numbers that mean anything:
+
+| Phase | Relative cost |
+| --- | --- |
+| `validate` | under a second |
+| `catalog` | tens of milliseconds |
+| `supporting` | negligible |
+| `detailed` cold | seconds, and dominates the total |
+| `detailed` re-run, nothing changed | milliseconds |
+| `detailed` with `force` | slightly more than the cold run |
+
+Decoding dominates, which is why an unchanged file is skipped rather than
+decoded again, and why the warm re-run is three orders of magnitude cheaper
+than the cold one. A forced re-decode costs more than the cold run because it
+deletes existing rows first. Deriving both split series adds roughly ten
+percent to the cold decode. Stream points, not activities, drive database
+size and peak memory.
 
 ## Tool reference
 
@@ -312,6 +342,11 @@ or a privacy-sensitive test artifact. The repository ignores:
 Tests use a small, fully synthetic fixture export committed under
 `tests/fixtures/`. Keep a real export, and the database generated from it,
 outside this repository.
+
+Tests are grouped by what they exercise: `tests/unit/` for pure derivation and
+parsing, `tests/integration/` for database-backed import and query behaviour,
+and `tests/functional/` for tests that drive the MCP tool surface over the
+real transport.
 
 ## Configuration reference
 

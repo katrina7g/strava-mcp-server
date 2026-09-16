@@ -6,8 +6,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig, type ServerConfig } from "../src/config.js";
-import { createServer } from "../src/server.js";
+import { loadConfig, type ServerConfig } from "../../src/config.js";
+import { createServer } from "../../src/server.js";
 
 describe("createServer", () => {
   it("creates an unconnected local read-only server", () => {

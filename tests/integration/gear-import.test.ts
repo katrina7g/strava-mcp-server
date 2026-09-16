@@ -5,13 +5,13 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { importActivityCatalog } from "../src/catalog.js";
-import { loadConfig, type ServerConfig } from "../src/config.js";
-import { closeDatabase, openDatabase, type Database } from "../src/database.js";
-import { gearDisplayName, getGear, importGear } from "../src/gear.js";
-import { normalizeMatchKey } from "../src/identity.js";
-import { createServer } from "../src/server.js";
-import { validateExport } from "../src/validator.js";
+import { importActivityCatalog } from "../../src/catalog.js";
+import { loadConfig, type ServerConfig } from "../../src/config.js";
+import { closeDatabase, openDatabase, type Database } from "../../src/database.js";
+import { gearDisplayName, getGear, importGear } from "../../src/gear.js";
+import { normalizeMatchKey } from "../../src/identity.js";
+import { createServer } from "../../src/server.js";
+import { validateExport } from "../../src/validator.js";
 
 const temporaryRoots: string[] = [];
 
@@ -25,7 +25,7 @@ async function committedFixture(): Promise<{ exportDir: string; dataDir: string 
   const root = await mkdtemp(join(tmpdir(), "strava-mcp-gear-"));
   temporaryRoots.push(root);
   const exportDir = join(root, "export");
-  await cp(fileURLToPath(new URL("./fixtures/minimal-export", import.meta.url)), exportDir, { recursive: true });
+  await cp(fileURLToPath(new URL("../fixtures/minimal-export", import.meta.url)), exportDir, { recursive: true });
   return { exportDir, dataDir: join(root, "cache") };
 }
 

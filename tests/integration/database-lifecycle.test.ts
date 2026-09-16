@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Sqlite from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig } from "../src/config.js";
-import { closeDatabase, openDatabase } from "../src/database.js";
+import { loadConfig } from "../../src/config.js";
+import { closeDatabase, openDatabase } from "../../src/database.js";
 
 const temporaryRoots: string[] = [];
 async function temporaryDataDir(): Promise<string> {

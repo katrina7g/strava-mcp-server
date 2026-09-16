@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveSplits, INTERVAL_METERS, type SplitPoint } from "../src/splits.js";
+import { deriveSplits, INTERVAL_METERS, type SplitPoint } from "../../src/splits.js";
 
 /** A steady track: one point per second, `metersPerSecond` apart. */
 function steadyTrack(count: number, metersPerSecond: number, overrides: Partial<SplitPoint> = {}): SplitPoint[] {

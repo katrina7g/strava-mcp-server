@@ -2,9 +2,9 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig } from "../src/config.js";
-import { closeDatabase, openDatabase } from "../src/database.js";
-import { validateExport } from "../src/validator.js";
+import { loadConfig } from "../../src/config.js";
+import { closeDatabase, openDatabase } from "../../src/database.js";
+import { validateExport } from "../../src/validator.js";
 
 const temporaryRoots: string[] = [];
 async function temporaryDirectory(): Promise<string> {

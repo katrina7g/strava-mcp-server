@@ -8,8 +8,8 @@ import Sqlite from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig, type ServerConfig } from "../src/config.js";
-import { createServer } from "../src/server.js";
+import { loadConfig, type ServerConfig } from "../../src/config.js";
+import { createServer } from "../../src/server.js";
 
 const temporaryRoots: string[] = [];
 
@@ -36,7 +36,7 @@ async function connectedClient(config: ServerConfig): Promise<Client> {
 async function copiedFixture(name: string): Promise<{ exportDir: string; dataDir: string }> {
   const root = await temporaryDirectory();
   const exportDir = join(root, "export");
-  await cp(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)), exportDir, { recursive: true });
+  await cp(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url)), exportDir, { recursive: true });
   return { exportDir, dataDir: join(root, "cache") };
 }
 

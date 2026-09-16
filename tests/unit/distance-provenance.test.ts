@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { haversineMeters, normalizeRouteProgression } from "../src/distance.js";
+import { haversineMeters, normalizeRouteProgression } from "../../src/distance.js";
 
 const timestamp = (second: number): string => `2026-01-01T00:00:${String(second).padStart(2, "0")}Z`;
 

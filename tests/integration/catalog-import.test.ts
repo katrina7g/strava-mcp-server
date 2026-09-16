@@ -3,11 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { ACTIVITY_CATALOG_COLUMN_MAP_VERSION, buildPositionalColumnMap, normalizeActivityCatalogRow } from "../src/catalog.js";
-import { importActivityCatalog } from "../src/catalog.js";
-import { loadConfig } from "../src/config.js";
-import { closeDatabase, openDatabase } from "../src/database.js";
-import { validateExport } from "../src/validator.js";
+import { ACTIVITY_CATALOG_COLUMN_MAP_VERSION, buildPositionalColumnMap, normalizeActivityCatalogRow } from "../../src/catalog.js";
+import { importActivityCatalog } from "../../src/catalog.js";
+import { loadConfig } from "../../src/config.js";
+import { closeDatabase, openDatabase } from "../../src/database.js";
+import { validateExport } from "../../src/validator.js";
 
 const temporaryRoots: string[] = [];
 async function fixture(): Promise<{ exportDir: string; dataDir: string }> {
@@ -23,7 +23,7 @@ async function fixture(): Promise<{ exportDir: string; dataDir: string }> {
 async function committedFixture(): Promise<{ exportDir: string; dataDir: string }> {
   const root = await mkdtemp(join(tmpdir(), "strava-mcp-committed-fixture-")); temporaryRoots.push(root);
   const exportDir = join(root, "export");
-  await cp(fileURLToPath(new URL("./fixtures/minimal-export", import.meta.url)), exportDir, { recursive: true });
+  await cp(fileURLToPath(new URL("../fixtures/minimal-export", import.meta.url)), exportDir, { recursive: true });
   return { exportDir, dataDir: join(root, "cache") };
 }
 
