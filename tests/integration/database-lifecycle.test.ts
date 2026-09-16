@@ -29,7 +29,7 @@ describe("Database initialization", () => {
     const snapshots = second.prepare("SELECT count(*) AS count FROM export_snapshots").get() as { count: number };
     closeDatabase(second);
 
-    expect(version.version).toBe(13);
+    expect(version.version).toBe(14);
     expect(snapshots.count).toBe(1);
   });
 
@@ -119,8 +119,11 @@ describe("Database initialization", () => {
       ALTER TABLE activity_files DROP COLUMN distance_derivation_version;
       ALTER TABLE activity_files DROP COLUMN decoded_at;
       ALTER TABLE activity_files DROP COLUMN split_derivation_version;
+      ALTER TABLE activities DROP COLUMN media_refs;
       DROP TABLE activity_distance_diagnostics;
       DROP TABLE activity_splits;
+      DROP TABLE activity_media;
+      DROP TABLE media;
     `);
     seed.prepare("UPDATE schema_version SET version = 9").run();
     closeDatabase(seed);
@@ -133,7 +136,7 @@ describe("Database initialization", () => {
     const foreignKeyViolations = upgraded.pragma("foreign_key_check") as unknown[];
     closeDatabase(upgraded);
 
-    expect(version.version).toBe(13);
+    expect(version.version).toBe(14);
     // No row is dropped by the rebuild, and a distance the decoder supplied
     // before provenance existed keeps both its value and its label.
     expect(streams).toEqual([

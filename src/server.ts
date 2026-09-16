@@ -10,6 +10,7 @@ import { closeDatabase, openDatabase, type Database } from "./database.js";
 import { guardTool, logInternalError, toolFailure, toolSuccess, type ToolResult } from "./errors.js";
 import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
 import { getGear, importGear } from "./gear.js";
+import { importMedia, listMedia } from "./media.js";
 import { MAX_GROUPS } from "./limits.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
@@ -196,13 +197,28 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_supporting_data",
     {
       title: "Import supporting data",
-      description: "Imports the export's supporting domains, currently gear, into the local database. Reuses the latest validation snapshot and never changes the source export.",
+      description: "Imports the export's supporting domains, currently gear and media references, into the local database. Reuses the latest validation snapshot and never changes the source export.",
       inputSchema: z.object({}),
     },
     async () => withExport(config, "import_supporting_data", async (exportDir, database) => {
       const snapshotId = await latestSnapshotId(exportDir, database);
-      return { snapshotId, domains: await importGear(exportDir, database, snapshotId) };
+      return { snapshotId, domains: [...await importGear(exportDir, database, snapshotId), ...await importMedia(exportDir, database, snapshotId)] };
     }),
+  );
+
+  server.registerTool(
+    "list_media",
+    {
+      title: "List media",
+      description: "Lists imported media references with their captions and activity links, paginated. Only validated relative paths and captions are stored: no media bytes are read and no EXIF, including location, is extracted.",
+      inputSchema: z.object({
+        activityId: z.string().trim().min(1).optional(),
+        source: z.enum(["media-file", "activity-catalog-only"]).optional(),
+        fileStatus: z.enum(["present", "missing"]).optional(),
+        page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+      }),
+    },
+    async (input) => withDatabase(config, "list_media", (database) => listMedia(database, input)),
   );
 
   server.registerTool(
@@ -226,7 +242,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
 
   server.registerTool(
     "get_data_schema",
-    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits"]).optional() }) },
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits", "media"]).optional() }) },
     async ({ domain }) => withDatabase(config, "get_data_schema", (database) => getDataSchema(database, domain)),
   );
 

@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 13;
+const LATEST_SCHEMA_VERSION = 14;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -80,6 +80,7 @@ function migrate(database: Database): void {
     if (currentVersion < 11) migrationEleven(database);
     if (currentVersion < 12) migrationTwelve(database);
     if (currentVersion < 13) migrationThirteen(database);
+    if (currentVersion < 14) migrationFourteen(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -492,6 +493,38 @@ function migrationThirteen(database: Database): void {
     );
     CREATE INDEX activity_splits_lookup
       ON activity_splits(activity_id, interval_kind, sequence);
+  `);
+}
+
+/** Media identity is its validated relative path: the export gives media no
+ * identifier, and the catalog and media.csv agree on the path alone. Only
+ * paths and captions are stored; no bytes are read and no EXIF is extracted.
+ * Column map version 5 adds the catalog's Media column, so a re-import
+ * backfills it. */
+function migrationFourteen(database: Database): void {
+  database.exec(`
+    ALTER TABLE activities ADD COLUMN media_refs TEXT;
+
+    CREATE TABLE media (
+      id TEXT PRIMARY KEY,
+      relative_path TEXT NOT NULL UNIQUE,
+      caption TEXT,
+      source TEXT NOT NULL,
+      file_status TEXT NOT NULL,
+      row_hash TEXT,
+      first_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
+      observation_status TEXT NOT NULL DEFAULT 'observed'
+    );
+    CREATE INDEX media_observation ON media(observation_status, source);
+
+    CREATE TABLE activity_media (
+      activity_id TEXT NOT NULL REFERENCES activities(id),
+      media_id TEXT NOT NULL REFERENCES media(id),
+      sequence INTEGER NOT NULL,
+      PRIMARY KEY (activity_id, media_id)
+    );
+    CREATE INDEX activity_media_by_media ON activity_media(media_id);
   `);
 }
 

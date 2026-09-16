@@ -86,8 +86,16 @@ const SPLIT_FIELDS = [
   { name: "distanceSource", type: "string", unit: "supplied | catalog-normalized-path | none", privacy: "private" },
 ] as const;
 
+const MEDIA_FIELDS = [
+  { name: "relativePath", type: "string", unit: null, privacy: "private" },
+  { name: "caption", type: "string", unit: null, privacy: "private" },
+  { name: "source", type: "string", unit: "media-file | activity-catalog-only", privacy: "private" },
+  { name: "fileStatus", type: "string", unit: "present | missing", privacy: "private" },
+  { name: "activityCount", type: "number", unit: "activities", privacy: "private" },
+  { name: "activityIds", type: "string[]", unit: null, privacy: "private" },
+] as const;
+
 const NOT_IMPORTED_DOMAINS = [
-  { domain: "media", reason: "No query tool is implemented yet; references are validated but not imported." },
   { domain: "challenges", reason: "No query tool is implemented yet." },
   { domain: "clubs", reason: "No query tool is implemented yet." },
   { domain: "social", reason: "No query tool is implemented yet. Reactions in an export are those the account gave, never those its activities received." },
@@ -206,6 +214,12 @@ export function getDataSchema(database: Database, domain?: string): object {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
     ...(domain === undefined || domain === "gear" ? { gear: { fields: GEAR_FIELDS, currentState: "gear", queryTool: "get_gear" } } : {}),
+    ...(domain === undefined || domain === "media" ? {
+      media: {
+        fields: MEDIA_FIELDS, currentState: "media", links: "activity_media", queryTool: "list_media",
+        note: "Only validated relative paths and captions are stored. No media bytes are read and no EXIF, including location, is extracted.",
+      },
+    } : {}),
     ...(domain === undefined || domain === "splits" ? {
       splits: {
         fields: SPLIT_FIELDS, currentState: "activity_splits", queryTool: "analyze_activity",

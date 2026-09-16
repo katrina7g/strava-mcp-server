@@ -139,7 +139,11 @@ describe("Gear over MCP", () => {
     // Empty gear sources are named, not silently absent.
     expect(summary.domains.availableButEmpty).toEqual(expect.arrayContaining(["bikes.csv", "components.csv"]));
     // A domain with no query tool must not look queryable.
-    expect(summary.domains.notImported.map((entry: { domain: string }) => entry.domain)).toEqual(expect.arrayContaining(["media", "social"]));
+    // Media has an importer and a query tool now, so it must not be listed
+    // among the domains that are present but not queryable.
+    const notImported = summary.domains.notImported.map((entry: { domain: string }) => entry.domain);
+    expect(notImported).toEqual(expect.arrayContaining(["social", "challenges"]));
+    expect(notImported).not.toContain("media");
     expect(schema.gear.queryTool).toBe("get_gear");
   });
 });
