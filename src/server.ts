@@ -12,6 +12,7 @@ import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from
 import { getGear, importGear } from "./gear.js";
 import { importMedia, listMedia } from "./media.js";
 import { getChallenges, getClubs, importCommunity } from "./community.js";
+import { getSocialSummary, importSocial } from "./social.js";
 import { MAX_GROUPS } from "./limits.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
@@ -198,13 +199,23 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_supporting_data",
     {
       title: "Import supporting data",
-      description: "Imports the export's supporting domains, currently gear, media references, challenges, clubs and memberships, into the local database. Reuses the latest validation snapshot and never changes the source export.",
+      description: "Imports the export's supporting domains, currently gear, media references, challenges, clubs, memberships and an aggregate social summary, into the local database. Reuses the latest validation snapshot and never changes the source export.",
       inputSchema: z.object({}),
     },
     async () => withExport(config, "import_supporting_data", async (exportDir, database) => {
       const snapshotId = await latestSnapshotId(exportDir, database);
-      return { snapshotId, domains: [...await importGear(exportDir, database, snapshotId), ...await importMedia(exportDir, database, snapshotId), ...await importCommunity(exportDir, database, snapshotId)] };
+      return { snapshotId, domains: [...await importGear(exportDir, database, snapshotId), ...await importMedia(exportDir, database, snapshotId), ...await importCommunity(exportDir, database, snapshotId), ...await importSocial(exportDir, database, snapshotId)] };
     }),
+  );
+
+  server.registerTool(
+    "get_social_summary",
+    {
+      title: "Get social summary",
+      description: "Returns aggregate counts of outbound social activity: follower and following totals, reactions by type and parent type, and reaction and comment counts by month. Only counts are stored, so no third-party athlete identifier and no comment text can be returned. Kudos and comments received are absent from a Strava export and are not reported.",
+      inputSchema: z.object({}),
+    },
+    async () => withDatabase(config, "get_social_summary", (database) => getSocialSummary(database)),
   );
 
   server.registerTool(
@@ -266,7 +277,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
 
   server.registerTool(
     "get_data_schema",
-    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits", "media", "challenges", "clubs"]).optional() }) },
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits", "media", "challenges", "clubs", "social"]).optional() }) },
     async ({ domain }) => withDatabase(config, "get_data_schema", (database) => getDataSchema(database, domain)),
   );
 

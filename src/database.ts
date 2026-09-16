@@ -4,7 +4,7 @@ import Sqlite from "better-sqlite3";
 import type { ServerConfig } from "./config.js";
 
 const DATABASE_FILE = "strava.sqlite";
-const LATEST_SCHEMA_VERSION = 15;
+const LATEST_SCHEMA_VERSION = 16;
 const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"];
 
 export type Database = Sqlite.Database;
@@ -82,6 +82,7 @@ function migrate(database: Database): void {
     if (currentVersion < 13) migrationThirteen(database);
     if (currentVersion < 14) migrationFourteen(database);
     if (currentVersion < 15) migrationFifteen(database);
+    if (currentVersion < 16) migrationSixteen(database);
     if (row === undefined) {
       database.prepare("INSERT INTO schema_version (version) VALUES (?)").run(LATEST_SCHEMA_VERSION);
     } else {
@@ -568,6 +569,25 @@ function migrationFifteen(database: Database): void {
       last_seen_snapshot_id INTEGER REFERENCES export_snapshots(id),
       observation_status TEXT NOT NULL DEFAULT 'observed'
     );
+  `);
+}
+
+/** The social sources are the only ones carrying other people's identifiers:
+ * follower and following athlete IDs, and reaction parent IDs pointing at
+ * activities that may not be this account's. Nothing row-level is stored.
+ * Only counts reach the database, so no third-party identifier and no comment
+ * text can be emitted by any tool, or recovered from the file if it leaks. */
+function migrationSixteen(database: Database): void {
+  database.exec(`
+    CREATE TABLE social_counts (
+      snapshot_id INTEGER NOT NULL REFERENCES export_snapshots(id),
+      metric TEXT NOT NULL,
+      dimension_kind TEXT NOT NULL,
+      dimension TEXT NOT NULL,
+      count INTEGER NOT NULL,
+      PRIMARY KEY (snapshot_id, metric, dimension_kind, dimension)
+    );
+    CREATE INDEX social_counts_snapshot ON social_counts(snapshot_id, metric);
   `);
 }
 

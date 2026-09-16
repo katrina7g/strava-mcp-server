@@ -116,8 +116,18 @@ const CLUB_FIELDS = [
   { name: "isMember", type: "boolean", unit: null, privacy: "private" },
 ] as const;
 
+const SOCIAL_FIELDS = [
+  { name: "followers.total", type: "number", unit: "people", privacy: "aggregate-only" },
+  { name: "following.total", type: "number", unit: "people", privacy: "aggregate-only" },
+  { name: "reactions.total", type: "number", unit: "reactions", privacy: "aggregate-only" },
+  { name: "reactions.reactionType", type: "object", unit: "count by type", privacy: "aggregate-only" },
+  { name: "reactions.parentType", type: "object", unit: "count by parent type", privacy: "aggregate-only" },
+  { name: "reactions.month", type: "object", unit: "count by ISO year-month", privacy: "aggregate-only" },
+  { name: "comments.total", type: "number", unit: "comments", privacy: "aggregate-only" },
+  { name: "comments.month", type: "object", unit: "count by ISO year-month", privacy: "aggregate-only" },
+] as const;
+
 const NOT_IMPORTED_DOMAINS = [
-  { domain: "social", reason: "No query tool is implemented yet. Reactions in an export are those the account gave, never those its activities received." },
   { domain: "profile-and-account", reason: "Profile, login, device, privacy-zone, preference, connected-app, contact, block, and flag sources are checksummed for change detection and never parsed." },
   { domain: "messaging", reason: "messaging.json is checksummed and never parsed." },
 ] as const;
@@ -233,6 +243,12 @@ export function getDataSchema(database: Database, domain?: string): object {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
     ...(domain === undefined || domain === "gear" ? { gear: { fields: GEAR_FIELDS, currentState: "gear", queryTool: "get_gear" } } : {}),
+    ...(domain === undefined || domain === "social" ? {
+      social: {
+        fields: SOCIAL_FIELDS, currentState: "social_counts", queryTool: "get_social_summary",
+        note: "Counts only. No follower, following, or parent activity identifier and no comment text is stored, so none can be returned. Every figure is outbound; kudos and comments received are absent from an export.",
+      },
+    } : {}),
     ...(domain === undefined || domain === "challenges" ? {
       challenges: { fields: CHALLENGE_FIELDS, currentState: "challenges", queryTool: "get_challenges" },
     } : {}),

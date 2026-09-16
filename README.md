@@ -74,8 +74,8 @@ Call these three tools once, in order, through any connected MCP client:
 2. `import_activity_catalog` imports `activities.csv`. It prints a delta of
    inserted, changed, unchanged, and no-longer-observed activities.
 3. `import_supporting_data` imports gear, meaning shoes, bikes, and
-   components, plus media references, challenges, clubs, and memberships,
-   linking each to the activities that reference it.
+   components, plus media references, challenges, clubs, memberships, and an
+   aggregate social summary, linking each to the activities that reference it.
 
 Then, optionally:
 
@@ -202,7 +202,7 @@ when a cap is hit.
 | Tool | Purpose |
 | --- | --- |
 | `get_archive_summary` | Coverage, sport counts, imported/empty/not-imported domains, and latest snapshot health. |
-| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain (`activities`, `gear`, `splits`, `media`, `challenges`, `clubs`). |
+| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain (`activities`, `gear`, `splits`, `media`, `challenges`, `clubs`, `social`). |
 
 **Activities**
 
@@ -233,6 +233,7 @@ when a cap is hit.
 | `list_media` | Imported media references with captions and activity links, paginated. Stores paths and captions only. |
 | `get_challenges` | Imported global and group challenges with join dates and completion, paginated. |
 | `get_clubs` | Imported clubs and the account's memberships, paginated. |
+| `get_social_summary` | Aggregate counts of outbound social activity. Stores counts only, never identifiers or comment text. |
 
 **Resources**
 
@@ -268,6 +269,16 @@ database. A path is stored only after it is confirmed to resolve inside the
 export's `media` directory; anything escaping that root is rejected and
 reported. A reference whose file is absent is kept and flagged rather than
 silently dropped, and a media row no activity references is kept too.
+
+**Social data is counted, never stored.** `followers.csv`, `following.csv`,
+`reactions.csv`, and `comments.csv` are the only sources describing other
+people: two are lists of third-party athlete IDs, reactions point at parent
+activities that need not be yours, and comments hold free text. The importer
+counts rows and discards every one of those values, so the database holds
+totals and month buckets and nothing else. No third-party identifier and no
+comment text can be returned, because neither is ever written down. Every
+figure is outbound; kudos and comments received are absent from an export and
+cannot be derived from one.
 
 **Account sources are never parsed at all.** Profile, login,
 device-identifier, privacy-zone, preference, connected-app, contact, block,
@@ -402,8 +413,7 @@ npm rebuild better-sqlite3
   tool states the formula it used in its own response.
 - Unbounded raw-stream delivery, unrestricted SQL execution, or automatic
   EXIF location extraction.
-- Social-summary import. Reactions and comments are validated and checksummed
-  but not parsed into queryable tables. `get_data_schema` and
-  `get_archive_summary` report the domain as not-imported rather than absent.
+- Kudos and comments received. A Strava export describes outbound activity
+  only, so no inbound figure can be derived and none is reported.
 - Reading media bytes or extracting EXIF. Media is referenced by path and
   caption only.

@@ -142,8 +142,9 @@ describe("Gear over MCP", () => {
     // Media has an importer and a query tool now, so it must not be listed
     // among the domains that are present but not queryable.
     const notImported = summary.domains.notImported.map((entry: { domain: string }) => entry.domain);
-    expect(notImported).toEqual(expect.arrayContaining(["social"]));
-    for (const queryable of ["media", "challenges", "clubs"]) expect(notImported).not.toContain(queryable);
+    // Only never-parsed sources remain: nothing with an importer is listed.
+    expect(notImported).toEqual(expect.arrayContaining(["profile-and-account", "messaging"]));
+    for (const queryable of ["media", "challenges", "clubs", "social"]) expect(notImported).not.toContain(queryable);
     expect(schema.gear.queryTool).toBe("get_gear");
   });
 });
