@@ -98,6 +98,26 @@ describe("Media references", () => {
     expect(none.media).toEqual([]);
   });
 
+  it("reports the domain as available when only the catalog names media", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "media"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\nrun-1,"Jan 2, 2026, 7:00:00 AM",One,Run,120,0.1,,110,100,5,media/only.jpg\n`);
+    // Headers but no rows, while the catalog still references a photo.
+    await writeFile(join(exportDir, "media.csv"), "Media Filename,Media Caption\n");
+    await writeFile(join(exportDir, "media", "only.jpg"), "not a real image");
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const imported = JSON.parse(textContent(await client.callTool({ name: "import_supporting_data", arguments: {} })));
+    const listed = JSON.parse(textContent(await client.callTool({ name: "list_media", arguments: {} })));
+    await client.close();
+
+    // Availability describes the domain, so it must not contradict what
+    // list_media returns.
+    expect(imported.domains.find((domain: { domain: string }) => domain.domain === "media").availability).toBe("available");
+    expect(listed.media).toHaveLength(1);
+  });
+
   it("reports an unsafe media reference and never imports it", async () => {
     const root = await temporaryDirectory();
     const exportDir = join(root, "export");

@@ -176,6 +176,36 @@ describe("Detailed import resilience", () => {
     expect(stream.totalPoints).toBe(2);
   });
 
+  it("re-derives when the catalog distance changes under an unchanged file", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    const track = `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.100" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.101" lon="-122.1"><time>2026-01-02T15:00:10Z</time></trkpt><trkpt lat="37.102" lon="-122.1"><time>2026-01-02T15:00:20Z</time></trkpt></trkseg></trk></gpx>`;
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), track);
+    const catalog = (km: string, meters: string) => `${CATALOG_HEADER}\ngpx-1,"Jan 2, 2026, 7:00:00 AM",GPX,Run,120,${km},activities/gpx-1.gpx,110,${meters},5\n`;
+    await writeFile(join(exportDir, "activities.csv"), catalog("0.2224", "222.4"));
+
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const before = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-1" } })));
+
+    // A fresh export restates the activity at a different distance while the
+    // linked file is byte-identical, which is what Strava recalculating a
+    // distance looks like on disk.
+    await writeFile(join(exportDir, "activities.csv"), catalog("0.3", "300"));
+    await client.callTool({ name: "validate_export", arguments: {} });
+    await client.callTool({ name: "import_activity_catalog", arguments: { revalidate: false } });
+    const reimported = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const after = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-1" } })));
+    await client.close();
+
+    expect(before.derived).toMatchObject({ totalDistanceMeters: 222.4, totalDistanceSource: "catalog-normalized-path" });
+    // The bytes did not change, but what they are normalized against did.
+    expect(reimported).toMatchObject({ decoded: 1, unchanged: 0 });
+    expect(after.derived).toMatchObject({ totalDistanceMeters: 300, totalDistanceSource: "catalog-normalized-path" });
+  });
+
   it("recomputes only the records a derivation-version bump affects", async () => {
     const root = await temporaryDirectory();
     const exportDir = join(root, "export"); const dataDir = join(root, "cache");

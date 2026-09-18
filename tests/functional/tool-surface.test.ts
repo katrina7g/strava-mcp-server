@@ -269,6 +269,29 @@ describe("MCP server tool surface", () => {
     await client.close();
   });
 
+  it("reports no pace drift when only one complete split exists", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    // 1.4 km yields one complete kilometre and a partial remainder, so there
+    // is no second complete split to compare the first against.
+    const points = Array.from({ length: 15 }, (_unused, index) => {
+      const time = new Date(Date.UTC(2026, 0, 1, 18, 0, 0) + index * 60_000).toISOString();
+      return `<trkpt lat="${(37 + index * 0.001).toFixed(3)}" lon="-122.1"><time>${time}</time></trkpt>`;
+    }).join("");
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-short,Jan 1 2026 10:00:00 AM,Short Run,Run,840,1.4,activities/gpx-short.gpx,840,1400,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-short.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg>${points}</trkseg></trk></gpx>`);
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const progression = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-short", analysisType: "progression" } })));
+    await client.close();
+
+    expect(progression.analysis.completeSplitsCompared).toBe(1);
+    // Null, not zero: zero would read as even pacing rather than as a
+    // comparison that could not be made.
+    expect(progression.analysis.paceDriftSecondsPerKm).toBeNull();
+  });
+
   it("falls back to catalog analysis, with a reason, when no route is eligible", async () => {
     const root = await temporaryDirectory(); const exportDir = join(root, "export");
     await mkdir(join(exportDir, "activities"), { recursive: true });

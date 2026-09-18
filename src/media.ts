@@ -116,7 +116,11 @@ export async function importMedia(exportDir: string, database: Database, snapsho
   });
   const noLongerObserved = apply();
 
-  const availability: Availability = parsed.availability === "unavailable" && byPath.size > 0 ? "available" : parsed.availability;
+  // Availability describes the domain, not one file. The catalog's Media
+  // column can carry references while media.csv is absent or holds only
+  // headers, and reporting empty then would contradict what list_media
+  // returns.
+  const availability: Availability = byPath.size > 0 ? "available" : parsed.availability;
   const delta: SupportingDelta = {
     domain: "media", sourcePath: MEDIA_SOURCE_PATH, availability,
     inserted, changed, unchanged, noLongerObserved, invalid,

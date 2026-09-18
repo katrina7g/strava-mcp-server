@@ -65,6 +65,90 @@ describe("split derivation", () => {
     expect(splits[0]!.paceSecondsPerKm).toBeCloseTo(500, 6);
   });
 
+  it("counts one pause per stop, not one per sample taken during it", () => {
+    // A device sampling every second through a 90 s stop emits 90 stationary
+    // segments. They describe one interruption, not ninety.
+    const points: SplitPoint[] = [];
+    let time = Date.UTC(2026, 0, 1); let distance = 0;
+    const push = (moving: boolean) => {
+      points.push({ timestamp: new Date(time).toISOString(), distanceMeters: distance, altitudeMeters: null, heartRate: null, cadence: null, powerWatts: null });
+      time += 1_000; if (moving) distance += 2;
+    };
+    for (let i = 0; i < 200; i += 1) push(true);
+    for (let i = 0; i < 90; i += 1) push(false);
+    for (let i = 0; i < 300; i += 1) push(true);
+    const [split] = deriveSplits(points, "km", "supplied").splits;
+
+    expect(split!.pauseCount).toBe(1);
+    expect(split!.pausedSeconds).toBeCloseTo(90, 6);
+    // 590 points give 589 segments; 90 of them are the stop.
+    expect(split!.elapsedSeconds).toBeCloseTo(589, 6);
+    expect(split!.movingSeconds).toBeCloseTo(499, 6);
+  });
+
+  it("counts two stops separately when movement resumes between them", () => {
+    const points: SplitPoint[] = [];
+    let time = Date.UTC(2026, 0, 1); let distance = 0;
+    const push = (moving: boolean) => {
+      points.push({ timestamp: new Date(time).toISOString(), distanceMeters: distance, altitudeMeters: null, heartRate: null, cadence: null, powerWatts: null });
+      time += 1_000; if (moving) distance += 2;
+    };
+    for (let i = 0; i < 100; i += 1) push(true);
+    for (let i = 0; i < 40; i += 1) push(false);
+    for (let i = 0; i < 100; i += 1) push(true);
+    for (let i = 0; i < 40; i += 1) push(false);
+    for (let i = 0; i < 300; i += 1) push(true);
+    const [split] = deriveSplits(points, "km", "supplied").splits;
+
+    expect(split!.pauseCount).toBe(2);
+    expect(split!.pausedSeconds).toBeCloseTo(80, 6);
+  });
+
+  it("ignores a brief dip below the pause threshold", () => {
+    // Speed wobbles under 0.5 m/s for a single sample at a time, twenty times
+    // over. That is a noisy fix or a shuffling stride, not twenty stops.
+    const points: SplitPoint[] = [];
+    let time = Date.UTC(2026, 0, 1); let distance = 0;
+    for (let index = 0; index < 600; index += 1) {
+      points.push({ timestamp: new Date(time).toISOString(), distanceMeters: distance, altitudeMeters: null, heartRate: null, cadence: null, powerWatts: null });
+      time += 1_000;
+      distance += index % 30 === 0 ? 0.2 : 2;
+    }
+    const [split] = deriveSplits(points, "km", "supplied").splits;
+
+    expect(split!.pauseCount).toBe(0);
+    // The slow seconds are still slow, so they remain in pausedSeconds.
+    expect(split!.pausedSeconds).toBeGreaterThan(0);
+  });
+
+  it("measures the activity to its furthest point, not its last record", () => {
+    // A device that emits a corrupt or reset final record must not shrink the
+    // activity: activity_bounds stores the maximum, so splits must agree.
+    const points = steadyTrack(1_001, 2);
+    points.push({ timestamp: "2026-01-01T01:00:00.000Z", distanceMeters: 5, altitudeMeters: null, heartRate: null, cadence: null, powerWatts: null });
+    const { splits, totalDistanceMeters } = deriveSplits(points, "km", "supplied");
+
+    expect(totalDistanceMeters).toBe(2_000);
+    expect(splits).toHaveLength(2);
+  });
+
+  it("credits a resumed stream only with the ground it actually covers", () => {
+    // The first record already carries distance, so the opening interval is
+    // only partly recorded and must not be priced as a whole kilometre.
+    const points: SplitPoint[] = Array.from({ length: 401 }, (_unused, index) => ({
+      timestamp: new Date(Date.UTC(2026, 0, 1) + index * 1_000).toISOString(),
+      distanceMeters: 200 + index * 2,
+      altitudeMeters: null, heartRate: null, cadence: null, powerWatts: null,
+    }));
+    const [split] = deriveSplits(points, "km", "supplied").splits;
+
+    expect(split!.distanceMeters).toBe(800);
+    expect(split!.complete).toBe(false);
+    // 800 m at 2 m/s is 400 s, which is 500 s per kilometre — the true pace,
+    // not the 400 s/km a full-interval assumption would report.
+    expect(split!.paceSecondsPerKm).toBeCloseTo(500, 6);
+  });
+
   it("reports which metrics a split actually carries", () => {
     const withHeartRate = steadyTrack(1_001, 1, { heartRate: 150 });
     const withoutAny = steadyTrack(1_001, 1);

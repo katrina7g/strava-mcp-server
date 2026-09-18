@@ -349,8 +349,11 @@ catalog are kept as internal diagnostics and are never used as a split basis.
 `analyze_activity` derives 1 km and 1 mile splits from that distance, with
 pace, heart rate, cadence, power, and separated elevation gain and loss. Each
 split lists the metrics it actually carries, so an absent metric is never read
-as a zero. A pause is movement below 0.5 m/s; a gap of more than 30 seconds
-that still covers ground is a hole in the recording rather than a rest, and is
+as a zero. `pausedSeconds` counts every second spent moving below 0.5 m/s,
+while `pauseCount` counts distinct stops, so a device that keeps sampling
+through a stop reports one pause rather than one per sample, and a brief dip
+below the threshold is not a stop at all. A gap of more than 30 seconds that
+still covers ground is a hole in the recording rather than a rest, and is
 counted separately as `recordingGapCount`.
 
 ## Data and Git hygiene

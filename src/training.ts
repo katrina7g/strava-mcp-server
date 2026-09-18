@@ -276,7 +276,7 @@ export function analyzeActivity(database: Database, activityId: string, analysis
           totalRecordingGapCount: stored.reduce((total, split) => total + split.recordingGapCount, 0),
           totalMovingSeconds: stored.reduce((total, split) => total + (split.movingSeconds ?? 0), 0),
           totalElapsedSeconds: stored.reduce((total, split) => total + (split.elapsedSeconds ?? 0), 0),
-          definition: "A pause is movement below 0.5 m/s between consecutive points. A recording gap is more than 30 s between points while still covering ground, reported separately because it is a hole in the data rather than a rest.",
+          definition: "pausedSeconds is every second spent moving below 0.5 m/s. pauseCount is the number of distinct stops that lasted at least 5 s, so a device sampling through one stop reports a single pause and a brief dip below the threshold reports none. A recording gap is more than 30 s between points while still covering ground, reported separately because it is a hole in the data rather than a rest.",
           splitsWithPauses: shown.filter((split) => split.pauseCount > 0).map((split) => ({
             sequence: split.sequence, pauseCount: split.pauseCount, pausedSeconds: split.pausedSeconds,
             recordingGapCount: split.recordingGapCount,
@@ -301,8 +301,11 @@ export function analyzeActivity(database: Database, activityId: string, analysis
           elevationGainMeters: split.elevationGainMeters, elevationLossMeters: split.elevationLossMeters,
           metricsAvailable: JSON.parse(split.metricsAvailableJson) as string[],
         })),
-        // Positive means the closing complete split was slower than the opening one.
-        paceDriftSecondsPerKm: first !== null && last !== null ? last - first : null,
+        // Positive means the closing complete split was slower than the opening
+        // one. Null below two complete splits: comparing a split with itself
+        // would report zero drift, which reads as even pacing rather than as
+        // no comparison having been possible.
+        paceDriftSecondsPerKm: paces.length >= 2 && first !== null && last !== null ? last - first : null,
         completeSplitsCompared: paces.length,
         definition: "Progression is the per-split series of pace, heart rate, and elevation change. Pace drift compares the last complete split to the first; partial splits are excluded because a short final interval is not comparable.",
       },

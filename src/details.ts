@@ -165,13 +165,16 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
       f.decode_status AS decodeStatus, f.decoded_sha256 AS decodedSha256,
       f.decoder_version AS decoderVersion, f.distance_derivation_version AS derivationVersion, f.split_derivation_version AS splitVersion,
       a.distance_meters AS catalogDistanceMeters,
+      (SELECT d.catalog_distance_meters FROM activity_distance_diagnostics d
+        WHERE d.activity_id = f.activity_id
+      ) AS derivedFromCatalogDistance,
       (SELECT m.sha256 FROM source_manifest m
         WHERE m.relative_path = f.relative_path
           AND m.snapshot_id = (SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1)
       ) AS currentSha256
     FROM activity_files f JOIN activities a ON a.id = f.activity_id
     WHERE f.activity_id IS NOT NULL ${activityId === undefined ? "" : "AND f.activity_id = ?"}
-  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; decodeStatus: string | null; decodedSha256: string | null; decoderVersion: number | null; derivationVersion: number | null; splitVersion: number | null; catalogDistanceMeters: number | null; currentSha256: string | null }[];
+  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; decodeStatus: string | null; decodedSha256: string | null; decoderVersion: number | null; derivationVersion: number | null; splitVersion: number | null; catalogDistanceMeters: number | null; derivedFromCatalogDistance: number | null; currentSha256: string | null }[];
   // A file's detail row can outlive the source that produced it — an export
   // may drop a file between snapshots. Decoding only proceeds for paths the
   // latest validation actually observed, not merely ones once recorded.
@@ -192,10 +195,19 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
     // Re-decoding identical bytes under unchanged formulas would rewrite the
     // same rows. A null checksum on either side means provenance is unknown,
     // so the file is decoded rather than assumed current.
+    //
+    // The catalog total is an input to the derivation, not just to the file:
+    // a catalog-normalized route scales its progression to it, and a route
+    // previously rejected for having no catalog distance becomes eligible once
+    // one exists. A re-export can change that total while leaving the linked
+    // file byte-identical, so the distance the stored rows were derived from
+    // is compared too, or those rows would keep a total the catalog no longer
+    // reports.
     const current = file.currentSha256;
     if (!force && file.decodeStatus === "decoded" && current !== null && file.decodedSha256 === current
       && file.decoderVersion === DECODER_VERSION && file.derivationVersion === ROUTE_DISTANCE_DERIVATION_VERSION
-      && file.splitVersion === SPLIT_DERIVATION_VERSION) {
+      && file.splitVersion === SPLIT_DERIVATION_VERSION
+      && file.derivedFromCatalogDistance === file.catalogDistanceMeters) {
       results.push({ activityId: file.activityId, status: "unchanged" });
       continue;
     }
