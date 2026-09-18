@@ -1,10 +1,13 @@
-import { elevationChangeMeters } from "./elevation.js";
+import { elevationChangeMeters, ELEVATION_NOISE_THRESHOLD_METERS } from "./elevation.js";
 import type { DistanceSource } from "./distance.js";
 
 /** Bump when the split formula changes, so stored splits recompute. */
 export const SPLIT_DERIVATION_VERSION = 1;
 
 export type IntervalKind = "km" | "mile";
+// Both series are derived and stored for every activity rather than converted
+// on demand, because a mile boundary falls inside a kilometre split and its
+// per-interval metrics cannot be recovered by scaling the kilometre figures.
 export const INTERVAL_METERS: Record<IntervalKind, number> = { km: 1_000, mile: 1_609.344 };
 
 // A pause is defined by speed, not by sampling rate. Treating any gap over
@@ -16,7 +19,6 @@ export const INTERVAL_METERS: Record<IntervalKind, number> = { km: 1_000, mile: 
 // reported separately instead of being silently folded into either total.
 const PAUSE_SPEED_METERS_PER_SECOND = 0.5;
 const RECORDING_GAP_SECONDS = 30;
-const ELEVATION_NOISE_THRESHOLD_METERS = 1;
 
 export type SplitPoint = {
   timestamp: string | null;
@@ -88,6 +90,14 @@ function emptyAccumulator(): Accumulator {
  * progression or nothing at all. Time is allocated to a split in proportion to
  * the distance covered inside it, so a segment spanning a boundary donates
  * time to both sides and the split elapsed times still sum to the activity's.
+ *
+ * Accuracy differs by source, and callers should treat the two differently.
+ * Checked against the catalog's own moving time, splits built on supplied
+ * distance agree to within a few percent, while catalog-normalized splits
+ * drift noticeably further: their per-point distance is a scaled estimate of
+ * where the athlete was, not a measurement, so a stretch of dense sampling
+ * absorbs more of the total than it should. Every split reports its
+ * distanceSource for exactly this reason.
  */
 export function deriveSplits(points: readonly SplitPoint[], intervalKind: IntervalKind, distanceSource: DistanceSource): SplitDerivation {
   const intervalMeters = INTERVAL_METERS[intervalKind];

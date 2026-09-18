@@ -24,11 +24,35 @@ export type NormalizedRoute<T extends DistancePoint> = {
   diagnostic: RouteDiagnostic;
 };
 
+/**
+ * Bump when eligibility or normalization changes what a route yields. Stored
+ * rows record the version that produced them, so a bump re-decodes exactly
+ * the activities whose distance and splits could now differ, and leaves the
+ * rest untouched.
+ */
 export const ROUTE_DISTANCE_DERIVATION_VERSION = 1;
 const EARTH_RADIUS_METERS = 6_371_008.8;
+
+// Two points describe a single segment, which is a straight line and no
+// evidence that a route was followed. Three is the least that can show
+// progression at all.
 const MIN_ROUTE_POINTS = 3;
+
+// Normalization spreads the catalog total across the recorded track, so it
+// assumes the track is the whole route. A few dropped points barely shift
+// where a boundary lands; a track missing a meaningful share of its
+// coordinates or timestamps no longer describes where the athlete went, and
+// scaling it would place splits confidently in the wrong places.
 const MIN_COORDINATE_COVERAGE = 0.98;
 const MIN_TIMESTAMP_COVERAGE = 0.98;
+
+// A guard against gross mismatch, not a precision threshold. Normalization
+// makes the total exact by construction, so this bound does not measure how
+// accurate the result is; it rejects tracks whose raw shape is too far from
+// the catalog total to plausibly be the same activity — a truncated
+// recording, or a file linked to the wrong row. Tightening it trades
+// eligible activities for no gain in the ones that remain, because the
+// scaling is what fixes the total either way.
 const MAX_RAW_CATALOG_ERROR_RATIO = 0.5;
 // A long timestamp gap alone can be a café stop. It becomes a route gap only
 // when it also jumps a substantial distance; an instantaneous large jump is

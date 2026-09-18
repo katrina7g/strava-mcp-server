@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import { createGunzip } from "node:zlib";
 import { SaxesParser } from "saxes";
 import type { Database } from "./database.js";
-import { elevationGainMeters } from "./elevation.js";
+import { elevationGainMeters, ELEVATION_NOISE_THRESHOLD_METERS } from "./elevation.js";
 import { normalizeRouteProgression, ROUTE_DISTANCE_DERIVATION_VERSION, type DistanceSource } from "./distance.js";
 import { deriveSplits, INTERVAL_METERS, SPLIT_DERIVATION_VERSION, type IntervalKind } from "./splits.js";
 import { logInternalError } from "./errors.js";
@@ -13,6 +13,11 @@ import { simplifyToLimit } from "./geometry.js";
 import { fitOffsetMinutes, resolveActivityLocalTimes } from "./localtime.js";
 import { withinRoot } from "./paths.js";
 
+// A gzip member declares nothing about its expanded size, so decoding is
+// bounded on three axes rather than trusting the file: what is read, what it
+// expands to, and how far it expands. A single activity does not approach any
+// of these, so tripping one means the input is malformed or hostile, not that
+// a legitimate export was too large.
 const MAX_COMPRESSED_BYTES = 50 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO = 100;
@@ -150,11 +155,6 @@ async function decode(path: string, format: DetailedActivity["format"]): Promise
   return parseFit(path, format === "fit.gz");
 }
 
-// Sensor/GPS altitude jitters by less than this between samples; counting
-// every positive tick as "climbed" overstates gain against the source
-// figure. See elevation.ts for why this is a hysteresis band, not a
-// per-step gate.
-const ELEVATION_NOISE_THRESHOLD_METERS = 1;
 /** Bump when decoding changes what a file produces, so stored rows are known
  * to be stale even though the source bytes are identical. */
 export const DECODER_VERSION = 1;
@@ -249,6 +249,12 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
  * supplies and TCX supplies only per lap: 222 of the 325 activities in the
  * reference export have none. The catalog carries a total for every activity,
  * so it is the fallback, and the source is always stated.
+ *
+ * The catalog's own elapsed time is not a usable cross-check against a
+ * stream: it counts time the device was not recording, so for a track with
+ * auto-pause or a stopped recording it can exceed the span between the first
+ * and last point by a wide margin. Compare against the track span, or against
+ * the catalog's moving time, but never against its elapsed time.
  */
 export function resolveTotalDistance(streamDistance: number | null, catalogDistance: number | null, streamSource: DistanceSource = "none"): { meters: number | null; source: DistanceSource | "catalog" | "none" } {
   if (streamDistance !== null) return { meters: streamDistance, source: streamSource };

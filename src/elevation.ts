@@ -12,6 +12,14 @@
  * the baseline is absorbed; a gradual climb still accumulates once its total
  * excursion clears the threshold, even though no single step did.
  */
+/**
+ * Sensor and GPS altitude jitter by less than this between samples, so
+ * counting every positive tick as climbed overstates gain against the
+ * source figure. It is the width of the hysteresis band below, not a
+ * per-step gate: see the note above for why that distinction matters.
+ */
+export const ELEVATION_NOISE_THRESHOLD_METERS = 1;
+
 export function elevationChangeMeters(altitudes: readonly (number | null)[], thresholdMeters: number): { gainMeters: number; lossMeters: number } | null {
   const samples = altitudes.filter((value): value is number => value !== null);
   if (samples.length === 0) return null;
