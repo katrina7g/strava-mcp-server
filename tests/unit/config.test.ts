@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ConfigError, loadConfig } from "../src/config.js";
+import { ConfigError, loadConfig } from "../../src/config.js";
 
 describe("loadConfig", () => {
   it("uses a cache directory outside the repository by default", () => {

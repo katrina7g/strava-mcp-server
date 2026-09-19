@@ -74,7 +74,8 @@ Call these three tools once, in order, through any connected MCP client:
 2. `import_activity_catalog` imports `activities.csv`. It prints a delta of
    inserted, changed, unchanged, and no-longer-observed activities.
 3. `import_supporting_data` imports gear, meaning shoes, bikes, and
-   components, and links it to the activities that reference it.
+   components, plus media references, challenges, clubs, memberships, and an
+   aggregate social summary, linking each to the activities that reference it.
 
 Then, optionally:
 
@@ -148,7 +149,37 @@ the export is readable before importing.
 | `npm run start` | Run the compiled stdio server. |
 | `npm run typecheck` | Typecheck production and test TypeScript. |
 | `npm test` | Run the test suite once. |
+| `npm run test:unit` | Pure derivation and parsing tests, no database. |
+| `npm run test:integration` | Database-backed import and query tests. |
+| `npm run test:functional` | Tests driving the real MCP tool surface. |
 | `npm run test:watch` | Run tests in watch mode. |
+| `npm run bench` | Build, then measure import cost against `STRAVA_EXPORT_DIR`. |
+
+## Performance
+
+`npm run bench` builds and then imports the export named by
+`STRAVA_EXPORT_DIR` into a temporary data directory, reporting per-phase wall
+time, rows written, database size, and peak resident memory as JSON. It never
+touches the configured `STRAVA_MCP_DATA_DIR` unless you pass `--reuse`.
+
+Rough shape on a mid-size export of a few hundred activities, Node 24 on
+darwin-arm64. Run it against your own export for numbers that mean anything:
+
+| Phase | Relative cost |
+| --- | --- |
+| `validate` | under a second |
+| `catalog` | tens of milliseconds |
+| `supporting` | negligible |
+| `detailed` cold | seconds, and dominates the total |
+| `detailed` re-run, nothing changed | milliseconds |
+| `detailed` with `force` | slightly more than the cold run |
+
+Decoding dominates, which is why an unchanged file is skipped rather than
+decoded again, and why the warm re-run is three orders of magnitude cheaper
+than the cold one. A forced re-decode costs more than the cold run because it
+deletes existing rows first. Deriving both split series adds roughly ten
+percent to the cold decode. Stream points, not activities, drive database
+size and peak memory.
 
 ## Tool reference
 
@@ -163,15 +194,15 @@ when a cap is hit.
 | `get_server_info` | Server identity, version, and whether an export is configured. |
 | `validate_export` | Read-only structural check of the configured export. Records a snapshot; never modifies the export. |
 | `import_activity_catalog` | Imports `activities.csv`. Reports a new/changed/unchanged/no-longer-observed delta. |
-| `import_supporting_data` | Imports supporting domains, currently gear only, over the same delta contract. |
-| `import_detailed_activities` | Decodes GPX/FIT/`.fit.gz`/`.tcx.gz` files into streams, laps, and bounds. Per-file failures don't stop the rest. |
+| `import_supporting_data` | Imports supporting domains: gear, media references, challenges, clubs, and memberships, over the same delta contract. |
+| `import_detailed_activities` | Decodes GPX/FIT/`.fit.gz`/`.tcx.gz` files into streams, laps, bounds, and splits. Unchanged files are skipped; pass `force` to decode anyway. Per-file failures don't stop the rest. |
 
 **Archive and schema**
 
 | Tool | Purpose |
 | --- | --- |
 | `get_archive_summary` | Coverage, sport counts, imported/empty/not-imported domains, and latest snapshot health. |
-| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain. |
+| `get_data_schema` | Field names, types, units, and privacy classification, optionally scoped to one domain (`activities`, `gear`, `splits`, `media`, `challenges`, `clubs`, `social`). |
 
 **Activities**
 
@@ -180,9 +211,9 @@ when a cap is hit.
 | `search_activities` | Filter by sport, date range, distance, duration, effort, or text; paginated. |
 | `aggregate_training` | Volume/duration/elevation/effort totals grouped by day, week, month, or sport. |
 | `get_activity` | One activity's catalog metadata, derived metrics, file/decode status, and telemetry availability. Never returns coordinates. |
-| `get_activity_stream` | Bounded telemetry points. Coordinates require `includeLocation: true` on that request. |
+| `get_activity_stream` | Bounded telemetry points, each with its `distanceSource`. Coordinates require `includeLocation: true` on that request. |
 | `get_activity_route` | Simplified route as GeoJSON, or a non-coordinate summary. Also requires `includeLocation: true` for geometry. |
-| `analyze_activity` | Catalog-level pace/intensity analysis with its limitations stated explicitly. |
+| `analyze_activity` | Catalog-level pace/intensity analysis, plus `splits`, `progression`, and `pauses` from decoded telemetry over 1 km or 1 mile intervals. Falls back to the catalog answer, with a reason, when no eligible route exists. |
 
 **Training analysis**
 
@@ -199,6 +230,10 @@ when a cap is hit.
 | Tool | Purpose |
 | --- | --- |
 | `get_gear` | Imported gear with usage counts and distance, paginated. |
+| `list_media` | Imported media references with captions and activity links, paginated. Stores paths and captions only. |
+| `get_challenges` | Imported global and group challenges with join dates and completion, paginated. |
+| `get_clubs` | Imported clubs and the account's memberships, paginated. |
+| `get_social_summary` | Aggregate counts of outbound social activity. Stores counts only, never identifiers or comment text. |
 
 **Resources**
 
@@ -225,6 +260,25 @@ ever return them. Asking for a coordinate field by name is not enough on its
 own, since the field is dropped and reported as withheld. The opt-in applies
 to one request and is never stored, inferred, or reused for a later call.
 `get_activity` never returns coordinates at any detail level.
+
+**Media is referenced, never read.** `list_media` reports the relative path
+and caption of each photo or video the export references, and which activities
+reference it. No media byte is ever read and no EXIF is extracted, so the
+location, device, and timestamp metadata embedded in a photo never enters the
+database. A path is stored only after it is confirmed to resolve inside the
+export's `media` directory; anything escaping that root is rejected and
+reported. A reference whose file is absent is kept and flagged rather than
+silently dropped, and a media row no activity references is kept too.
+
+**Social data is counted, never stored.** `followers.csv`, `following.csv`,
+`reactions.csv`, and `comments.csv` are the only sources describing other
+people: two are lists of third-party athlete IDs, reactions point at parent
+activities that need not be yours, and comments hold free text. The importer
+counts rows and discards every one of those values, so the database holds
+totals and month buckets and nothing else. No third-party identifier and no
+comment text can be returned, because neither is ever written down. Every
+figure is outbound; kudos and comments received are absent from an export and
+cannot be derived from one.
 
 **Account sources are never parsed at all.** Profile, login,
 device-identifier, privacy-zone, preference, connected-app, contact, block,
@@ -269,6 +323,39 @@ The local offset comes from, in order:
 Pass `timeBasis: "utc"` to any of the three grouping tools to bypass local
 time and group by UTC calendar boundaries instead.
 
+## Distance, splits, and what they are derived from
+
+Two thirds of a typical export carries no per-point distance at all, so a
+split boundary cannot always be measured. Each activity therefore states where
+its distance came from, and tools that depend on it say so in their responses.
+
+- **`supplied`** — the file recorded distance per point. FIT and some TCX
+  files do. This is used exactly as recorded.
+- **`catalog-normalized-path`** — a GPX or TCX route with no recorded
+  distance, whose cumulative position was scaled to the total distance the
+  activity catalog reports. The route decides *where* progress happened; the
+  catalog decides *how far*. This is not a measured odometer, and every
+  response built on it says so.
+- **`none`** — neither is available, so no splits are derived and the reason
+  is reported instead of a fabricated number.
+
+Normalization is only applied to a route that passes continuity checks: enough
+valid coordinates and timestamps, no discontinuity large enough to make
+position ambiguous, and a bounded difference between the raw GPS length and
+the catalog total. A route that fails any check is reported as ineligible with
+the reason, without coordinates. Raw GPS length and its error against the
+catalog are kept as internal diagnostics and are never used as a split basis.
+
+`analyze_activity` derives 1 km and 1 mile splits from that distance, with
+pace, heart rate, cadence, power, and separated elevation gain and loss. Each
+split lists the metrics it actually carries, so an absent metric is never read
+as a zero. `pausedSeconds` counts every second spent moving below 0.5 m/s,
+while `pauseCount` counts distinct stops, so a device that keeps sampling
+through a stop reports one pause rather than one per sample, and a brief dip
+below the threshold is not a stop at all. A gap of more than 30 seconds that
+still covers ground is a hole in the recording rather than a rest, and is
+counted separately as `recordingGapCount`.
+
 ## Data and Git hygiene
 
 Do not commit a real Strava export, a generated database, an API credential,
@@ -282,6 +369,11 @@ or a privacy-sensitive test artifact. The repository ignores:
 Tests use a small, fully synthetic fixture export committed under
 `tests/fixtures/`. Keep a real export, and the database generated from it,
 outside this repository.
+
+Tests are grouped by what they exercise: `tests/unit/` for pure derivation and
+parsing, `tests/integration/` for database-backed import and query behaviour,
+and `tests/functional/` for tests that drive the MCP tool surface over the
+real transport.
 
 ## Configuration reference
 
@@ -324,10 +416,7 @@ npm rebuild better-sqlite3
   tool states the formula it used in its own response.
 - Unbounded raw-stream delivery, unrestricted SQL execution, or automatic
   EXIF location extraction.
-- Split-based pacing, telemetry progression, and per-split analysis. Device
-  coverage for the underlying data is too uneven across activities to support
-  these reliably at this time.
-- Media, challenge, club, and social-summary import. These sources are
-  validated, and media is also checksummed, but none of them are parsed into
-  queryable tables. `get_data_schema` and `get_archive_summary` report them as
-  not-imported rather than absent.
+- Kudos and comments received. A Strava export describes outbound activity
+  only, so no inbound figure can be derived and none is reported.
+- Reading media bytes or extracting EXIF. Media is referenced by path and
+  caption only.

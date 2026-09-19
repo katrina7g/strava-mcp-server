@@ -136,6 +136,7 @@ export async function validateExport(exportDir: string, database: Database): Pro
   const previousMap = new Map(previous.map((entry) => [entry.relative_path, entry.sha256]));
   const entries: ManifestEntry[] = [];
   const referenced = new Map<string, string[]>();
+  const catalogMediaReferences: string[] = [];
   for (const relativePath of allFiles) {
     const absolutePath = resolve(root, relativePath);
     try {
@@ -149,6 +150,12 @@ export async function validateExport(exportDir: string, database: Database): Pro
         if (csv.rowWidthError) { errorSummary = "CSV row width differs from header width"; findings.push({ code: "CSV_ROW_WIDTH_INVALID", severity: "error", path: relativePath, message: errorSummary }); }
         const filenameIndex = csv.headers.indexOf(relativePath === "activities.csv" ? "Filename" : "Media Filename");
         if (filenameIndex >= 0 && (relativePath === "activities.csv" || basename(relativePath) === "media.csv")) referenced.set(relativePath, csv.rows.map((row) => row[filenameIndex] ?? ""));
+        // The catalog's Media column holds several pipe-delimited paths per
+        // row, so it is flattened here and checked like any other reference.
+        const mediaIndex = relativePath === "activities.csv" ? csv.headers.indexOf("Media") : -1;
+        if (mediaIndex >= 0) {
+          catalogMediaReferences.push(...csv.rows.flatMap((row) => (row[mediaIndex] ?? "").split("|").map((part) => part.trim()).filter((part) => part !== "")));
+        }
       }
       if ((relativePath.endsWith(".fit.gz") || relativePath.endsWith(".tcx.gz")) && !(await gzipReadable(absolutePath))) { errorSummary = "Gzip input is unreadable"; findings.push({ code: "GZIP_UNREADABLE", severity: "error", path: relativePath, message: errorSummary }); }
       const sha256 = await checksum(absolutePath); const old = previousMap.get(relativePath);
@@ -168,6 +175,15 @@ export async function validateExport(exportDir: string, database: Database): Pro
         errorSummary: "Source file could not be read",
       });
     }
+  }
+  // A catalog media reference with no media.csv row is a warning, not an
+  // error: the file itself is what matters, and the two sources disagree in
+  // both directions in practice.
+  const mediaFileRows = new Set(referenced.get("media.csv") ?? []);
+  for (const sourcePath of new Set(catalogMediaReferences)) {
+    if (!safelyReferenced(root, "media", sourcePath)) findings.push({ code: "REFERENCED_PATH_UNSAFE", severity: "error", path: "activities.csv", message: `Unsafe referenced path: ${sourcePath}` });
+    else if (!allFiles.includes(sourcePath)) findings.push({ code: "REFERENCED_FILE_MISSING", severity: "error", path: sourcePath, message: "Referenced file is missing." });
+    else if (!mediaFileRows.has(sourcePath)) findings.push({ code: "MEDIA_REFERENCE_UNLISTED", severity: "warning", path: sourcePath, message: "Activity references media that media.csv does not list." });
   }
   for (const [catalog, paths] of referenced) for (const sourcePath of paths) {
     const directory = catalog === "activities.csv" ? "activities" : "media";

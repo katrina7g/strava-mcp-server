@@ -61,11 +61,73 @@ const GEAR_FIELDS = [
  * into a queryable table. Naming them keeps a client from inferring that a
  * domain is absent from the export when it is merely not imported.
  */
+const SPLIT_FIELDS = [
+  { name: "sequence", type: "number", unit: "index", privacy: "private" },
+  { name: "startDistanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "endDistanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "distanceMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "complete", type: "boolean", unit: null, privacy: "private" },
+  { name: "startedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "endedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "elapsedSeconds", type: "number", unit: "seconds", privacy: "private" },
+  { name: "movingSeconds", type: "number", unit: "seconds", privacy: "private" },
+  { name: "pausedSeconds", type: "number", unit: "seconds", privacy: "private" },
+  { name: "pauseCount", type: "number", unit: "pauses", privacy: "private" },
+  { name: "recordingGapCount", type: "number", unit: "gaps", privacy: "private" },
+  { name: "paceSecondsPerKm", type: "number", unit: "seconds per kilometre", privacy: "private" },
+  { name: "averageHeartRate", type: "number", unit: "bpm", privacy: "private" },
+  { name: "maxHeartRate", type: "number", unit: "bpm", privacy: "private" },
+  { name: "averageCadence", type: "number", unit: "rpm", privacy: "private" },
+  { name: "averagePowerWatts", type: "number", unit: "watts", privacy: "private" },
+  { name: "elevationGainMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "elevationLossMeters", type: "number", unit: "meters", privacy: "private" },
+  { name: "pointCount", type: "number", unit: "points", privacy: "private" },
+  { name: "metricsAvailable", type: "string[]", unit: null, privacy: "private" },
+  { name: "distanceSource", type: "string", unit: "supplied | catalog-normalized-path | none", privacy: "private" },
+] as const;
+
+const MEDIA_FIELDS = [
+  { name: "relativePath", type: "string", unit: null, privacy: "private" },
+  { name: "caption", type: "string", unit: null, privacy: "private" },
+  { name: "source", type: "string", unit: "media-file | activity-catalog-only", privacy: "private" },
+  { name: "fileStatus", type: "string", unit: "present | missing", privacy: "private" },
+  { name: "activityCount", type: "number", unit: "activities", privacy: "private" },
+  { name: "activityIds", type: "string[]", unit: null, privacy: "private" },
+] as const;
+
+const CHALLENGE_FIELDS = [
+  { name: "scope", type: "string", unit: "global | group", privacy: "private" },
+  { name: "name", type: "string", unit: null, privacy: "private" },
+  { name: "joinedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "completed", type: "boolean", unit: null, privacy: "private" },
+] as const;
+
+const CLUB_FIELDS = [
+  { name: "name", type: "string", unit: null, privacy: "private" },
+  { name: "description", type: "string", unit: null, privacy: "private" },
+  { name: "clubType", type: "string", unit: null, privacy: "private" },
+  { name: "sport", type: "string", unit: null, privacy: "private" },
+  { name: "city", type: "string", unit: null, privacy: "private" },
+  { name: "state", type: "string", unit: null, privacy: "private" },
+  { name: "country", type: "string", unit: null, privacy: "private" },
+  { name: "website", type: "string", unit: null, privacy: "private" },
+  { name: "source", type: "string", unit: "club-file | membership-only", privacy: "private" },
+  { name: "joinedAt", type: "datetime", unit: "ISO-8601", privacy: "private" },
+  { name: "isMember", type: "boolean", unit: null, privacy: "private" },
+] as const;
+
+const SOCIAL_FIELDS = [
+  { name: "followers.total", type: "number", unit: "people", privacy: "aggregate-only" },
+  { name: "following.total", type: "number", unit: "people", privacy: "aggregate-only" },
+  { name: "reactions.total", type: "number", unit: "reactions", privacy: "aggregate-only" },
+  { name: "reactions.reactionType", type: "object", unit: "count by type", privacy: "aggregate-only" },
+  { name: "reactions.parentType", type: "object", unit: "count by parent type", privacy: "aggregate-only" },
+  { name: "reactions.month", type: "object", unit: "count by ISO year-month", privacy: "aggregate-only" },
+  { name: "comments.total", type: "number", unit: "comments", privacy: "aggregate-only" },
+  { name: "comments.month", type: "object", unit: "count by ISO year-month", privacy: "aggregate-only" },
+] as const;
+
 const NOT_IMPORTED_DOMAINS = [
-  { domain: "media", reason: "No query tool is implemented yet; references are validated but not imported." },
-  { domain: "challenges", reason: "No query tool is implemented yet." },
-  { domain: "clubs", reason: "No query tool is implemented yet." },
-  { domain: "social", reason: "No query tool is implemented yet. Reactions in an export are those the account gave, never those its activities received." },
   { domain: "profile-and-account", reason: "Profile, login, device, privacy-zone, preference, connected-app, contact, block, and flag sources are checksummed for change detection and never parsed." },
   { domain: "messaging", reason: "messaging.json is checksummed and never parsed." },
 ] as const;
@@ -142,9 +204,10 @@ export function getActivity(database: Database, activityId: string): object {
   if (activity === undefined) return { found: false, activityId, message: "No imported activity matches this ID." };
 
   const files = database.prepare("SELECT relative_path AS relativePath, format, decode_status AS decodeStatus, parse_error AS parseError FROM activity_files WHERE activity_id = ? ORDER BY relative_path").all(activityId);
-  const bounds = database.prepare("SELECT point_count AS pointCount, started_at AS startedAt, ended_at AS endedAt, total_distance_meters AS streamDistanceMeters, elevation_gain_meters AS elevationGainMeters, has_location AS hasLocation FROM activity_bounds WHERE activity_id = ?").get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; elevationGainMeters: number | null; hasLocation: number } | undefined;
+  const bounds = database.prepare("SELECT point_count AS pointCount, started_at AS startedAt, ended_at AS endedAt, total_distance_meters AS streamDistanceMeters, distance_source AS streamDistanceSource, elevation_gain_meters AS elevationGainMeters, has_location AS hasLocation FROM activity_bounds WHERE activity_id = ?").get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; streamDistanceSource: "supplied" | "catalog-normalized-path" | "none"; elevationGainMeters: number | null; hasLocation: number } | undefined;
+  const distanceAnalysis = database.prepare("SELECT quality_status AS qualityStatus, withheld_reason AS withheldReason, derivation_version AS derivationVersion FROM activity_distance_diagnostics WHERE activity_id = ?").get(activityId);
   const laps = database.prepare("SELECT COUNT(*) AS count FROM activity_laps WHERE activity_id = ?").get(activityId) as { count: number };
-  const distance = resolveTotalDistance(bounds?.streamDistanceMeters ?? null, typeof activity.distanceMeters === "number" ? activity.distanceMeters : null);
+  const distance = resolveTotalDistance(bounds?.streamDistanceMeters ?? null, typeof activity.distanceMeters === "number" ? activity.distanceMeters : null, bounds?.streamDistanceSource ?? "none");
   const movingSeconds = activity.movingSeconds ?? activity.durationSeconds;
   const pace = typeof distance.meters === "number" && distance.meters > 0 && typeof movingSeconds === "number" ? (movingSeconds * 1000) / distance.meters : null;
 
@@ -163,10 +226,11 @@ export function getActivity(database: Database, activityId: string): object {
         imported: true, pointCount: bounds.pointCount, lapCount: laps.count,
         firstPointAt: bounds.startedAt, lastPointAt: bounds.endedAt,
         elevationGainMeters: bounds.elevationGainMeters, hasLocation: bounds.hasLocation === 1,
+        distanceAnalysis: distanceAnalysis ?? { qualityStatus: "unavailable", message: "No route-distance diagnostic has been computed." },
       },
     limitations: [
       "Coordinates are never returned by this tool; use get_activity_route with includeLocation.",
-      "Split counts and split-based pacing require detailed analysis, which is not implemented.",
+      "Split counts and split-based pacing come from analyze_activity, and need a usable distance source: file-supplied distance, or a route eligible for catalog normalization.",
       "telemetry.elevationGainMeters is computed from raw device altitude with basic noise smoothing, not Strava's own corrected figure; it can diverge from activity.elevationGainMeters, especially on undulating terrain.",
     ],
   };
@@ -179,6 +243,34 @@ export function getDataSchema(database: Database, domain?: string): object {
     domain: domain ?? "all",
     activities: { fields, rawCatalogRows: "activity_catalog_rows", currentState: "activities" },
     ...(domain === undefined || domain === "gear" ? { gear: { fields: GEAR_FIELDS, currentState: "gear", queryTool: "get_gear" } } : {}),
+    ...(domain === undefined || domain === "social" ? {
+      social: {
+        fields: SOCIAL_FIELDS, currentState: "social_counts", queryTool: "get_social_summary",
+        note: "Counts only. No follower, following, or parent activity identifier and no comment text is stored, so none can be returned. Every figure is outbound; kudos and comments received are absent from an export.",
+      },
+    } : {}),
+    ...(domain === undefined || domain === "challenges" ? {
+      challenges: { fields: CHALLENGE_FIELDS, currentState: "challenges", queryTool: "get_challenges" },
+    } : {}),
+    ...(domain === undefined || domain === "clubs" ? {
+      clubs: {
+        fields: CLUB_FIELDS, currentState: "clubs", memberships: "club_memberships", queryTool: "get_clubs",
+        note: "A club named only by a membership is stored with its name alone, since clubs.csv may be empty while memberships.csv is not.",
+      },
+    } : {}),
+    ...(domain === undefined || domain === "media" ? {
+      media: {
+        fields: MEDIA_FIELDS, currentState: "media", links: "activity_media", queryTool: "list_media",
+        note: "Only validated relative paths and captions are stored. No media bytes are read and no EXIF, including location, is extracted.",
+      },
+    } : {}),
+    ...(domain === undefined || domain === "splits" ? {
+      splits: {
+        fields: SPLIT_FIELDS, currentState: "activity_splits", queryTool: "analyze_activity",
+        intervals: ["km", "mile"],
+        note: "Splits exist only where a distance source supports interval boundaries: distance the file supplied, or a route eligible for normalization to the catalog total. distanceSource states which, and no split carries a coordinate.",
+      },
+    } : {}),
     notImported: NOT_IMPORTED_DOMAINS,
     sourceColumnMap: latestMap === undefined ? null : { mapVersion: latestMap.mapVersion, columns: JSON.parse(latestMap.columns) },
     note: "Direct identifiers and raw source values are not exposed by activity query tools. Exact coordinates are withheld unless a request to get_activity_route or get_activity_stream sets includeLocation to true.",

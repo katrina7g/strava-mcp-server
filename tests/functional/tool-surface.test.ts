@@ -6,8 +6,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig, type ServerConfig } from "../src/config.js";
-import { createServer } from "../src/server.js";
+import { loadConfig, type ServerConfig } from "../../src/config.js";
+import { createServer } from "../../src/server.js";
 
 describe("createServer", () => {
   it("creates an unconnected local read-only server", () => {
@@ -160,10 +160,11 @@ describe("MCP server tool surface", () => {
     expect(bests.results[0]).toMatchObject({ id: "run-2" });
     expect(activity.analysis.averagePaceSecondsPerKm).toBe(350);
     expect(activity.limitations[0]).toContain("Catalog-only analysis");
-    // Splits are unimplemented, not merely pending a detailed-format import.
-    expect(activity.limitations.join(" ")).toContain("not implemented");
-    expect(activity.limitations.join(" ")).not.toContain("until detailed");
-    expect(sports.capabilities.unavailable).toContain("not implemented");
+    // Catalog-level pace names the telemetry analysis that supersedes it,
+    // rather than describing splits as unavailable.
+    expect(activity.limitations.join(" ")).toContain("splits");
+    expect(activity.limitations.join(" ")).not.toContain("not implemented");
+    expect(sports.capabilities.unavailable).toContain("analyze_activity");
     expect(load).toMatchObject({ source: "supplied catalog Training Load", groups: [expect.objectContaining({ trainingLoad: 40 }), expect.objectContaining({ trainingLoad: 55 })] });
     await client.close();
   });
@@ -191,8 +192,8 @@ describe("MCP server tool surface", () => {
   it("serves get_activity with decode status, lap count, and no coordinates", async () => {
     const root = await temporaryDirectory(); const exportDir = join(root, "export");
     await mkdir(join(exportDir, "activities"), { recursive: true });
-    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n");
-    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.2\"><ele>15</ele><time>2026-01-01T18:01:00Z</time></trkpt></trkseg></trk></gpx>");
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-1,Jan 1 2026 10:00:00 AM,GPX Run,Run,120,0.2224,activities/gpx-1.gpx,110,222.4,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.101\" lon=\"-122.1\"><ele>15</ele><time>2026-01-01T18:00:10Z</time></trkpt><trkpt lat=\"37.102\" lon=\"-122.1\"><ele>20</ele><time>2026-01-01T18:00:20Z</time></trkpt></trkseg></trk></gpx>");
     const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
     await client.callTool({ name: "import_activity_catalog", arguments: {} });
     await client.callTool({ name: "import_detailed_activities", arguments: {} });
@@ -201,11 +202,114 @@ describe("MCP server tool surface", () => {
 
     expect(activity).toMatchObject({ found: true, activity: { id: "gpx-1", sportType: "Run" } });
     expect(activity.files[0]).toMatchObject({ format: "gpx", decodeStatus: "decoded" });
-    expect(activity.telemetry).toMatchObject({ imported: true, pointCount: 2, lapCount: 0, hasLocation: true });
-    // GPX supplies no per-point distance, so the catalog total is used and labelled.
-    expect(activity.derived).toMatchObject({ totalDistanceMeters: 100, totalDistanceSource: "catalog" });
+    expect(activity.telemetry).toMatchObject({ imported: true, pointCount: 3, lapCount: 0, hasLocation: true });
+    expect(activity.derived.totalDistanceSource).toBe("catalog-normalized-path");
+    expect(activity.telemetry.distanceAnalysis).toMatchObject({ qualityStatus: "eligible" });
     expect(JSON.stringify(activity)).not.toContain("-122.1");
     expect(missing).toMatchObject({ found: false });
+    await client.close();
+  });
+
+  it("withholds distance analysis, with a coordinate-free reason, for an ineligible route", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-gap,Jan 1 2026 10:00:00 AM,Gapped Run,Run,600,11.2,activities/gpx-gap.gpx,600,11200,5\n");
+    // The third point jumps roughly eleven kilometres after a ten-minute
+    // silence, so route position between the two segments is unknowable.
+    await writeFile(join(exportDir, "activities", "gpx-gap.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><ele>10</ele><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.101\" lon=\"-122.1\"><ele>12</ele><time>2026-01-01T18:00:10Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.1\"><ele>15</ele><time>2026-01-01T18:10:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const activity = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-gap" } })));
+    const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-gap", fields: ["distanceMeters", "distanceSource"] } })));
+
+    expect(activity.telemetry.distanceAnalysis).toMatchObject({ qualityStatus: "ineligible", withheldReason: expect.stringContaining("discontinuity") });
+    // An ineligible route yields no per-point distance at all, so the catalog
+    // total is the only figure left and must be labelled as such.
+    expect(activity.derived).toMatchObject({ totalDistanceMeters: 11200, totalDistanceSource: "catalog" });
+    expect(stream.fieldAvailability.distanceMeters).toBe(0);
+    expect(stream.points.every((point: { distanceSource: string }) => point.distanceSource === "none")).toBe(true);
+    // The reason explains the rejection without disclosing where it happened.
+    expect(JSON.stringify(activity)).not.toContain("-122.1");
+    expect(JSON.stringify(activity)).not.toContain("37.2");
+    await client.close();
+  });
+
+  it("serves splits, progression, and pauses from decoded telemetry", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    // 2.4 km of catalog distance over a straight track, so the route is
+    // eligible and normalization yields two whole splits and a partial one.
+    const points = Array.from({ length: 25 }, (_unused, index) => {
+      const time = new Date(Date.UTC(2026, 0, 1, 18, 0, 0) + index * 60_000).toISOString();
+      return `<trkpt lat="${(37 + index * 0.001).toFixed(3)}" lon="-122.1"><ele>${10 + index}</ele><time>${time}</time><extensions><gpxtpx:hr xmlns:gpxtpx="x">${140 + index}</gpxtpx:hr></extensions></trkpt>`;
+    }).join("");
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-splits,Jan 1 2026 10:00:00 AM,Split Run,Run,1440,2.4,activities/gpx-splits.gpx,1440,2400,20\n");
+    await writeFile(join(exportDir, "activities", "gpx-splits.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg>${points}</trkseg></trk></gpx>`);
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const splits = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "splits" } })));
+    const miles = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "splits", intervalKind: "mile" } })));
+    const progression = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "progression" } })));
+    const pauses = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits", analysisType: "pauses" } })));
+
+    expect(splits).toMatchObject({ found: true, analysisType: "splits", distanceSource: "catalog-normalized-path", intervalKind: "km", intervalMeters: 1000 });
+    expect(splits.analysis.splits).toHaveLength(3);
+    expect(splits.analysis.splits.map((split: { complete: boolean }) => split.complete)).toEqual([true, true, false]);
+    // A normalized route must say so wherever a split is reported.
+    expect(splits.boundaryBasis).toContain("normalized to the catalog total");
+    expect(splits.analysis.splits[0].metricsAvailable).toContain("heartRate");
+    expect(miles).toMatchObject({ intervalKind: "mile", intervalMeters: 1609.344 });
+    expect(progression.analysis.series).toHaveLength(3);
+    expect(progression.analysis.paceDriftSecondsPerKm).toBeCloseTo(0, 3);
+    expect(pauses.analysis).toMatchObject({ totalPauseCount: 0, totalPausedSeconds: 0 });
+    expect(pauses.analysis.totalElapsedSeconds).toBeCloseTo(1440, 3);
+    expect(JSON.stringify(splits)).not.toContain("-122.1");
+    await client.close();
+  });
+
+  it("reports no pace drift when only one complete split exists", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    // 1.4 km yields one complete kilometre and a partial remainder, so there
+    // is no second complete split to compare the first against.
+    const points = Array.from({ length: 15 }, (_unused, index) => {
+      const time = new Date(Date.UTC(2026, 0, 1, 18, 0, 0) + index * 60_000).toISOString();
+      return `<trkpt lat="${(37 + index * 0.001).toFixed(3)}" lon="-122.1"><time>${time}</time></trkpt>`;
+    }).join("");
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-short,Jan 1 2026 10:00:00 AM,Short Run,Run,840,1.4,activities/gpx-short.gpx,840,1400,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-short.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg>${points}</trkseg></trk></gpx>`);
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const progression = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-short", analysisType: "progression" } })));
+    await client.close();
+
+    expect(progression.analysis.completeSplitsCompared).toBe(1);
+    // Null, not zero: zero would read as even pacing rather than as a
+    // comparison that could not be made.
+    expect(progression.analysis.paceDriftSecondsPerKm).toBeNull();
+  });
+
+  it("falls back to catalog analysis, with a reason, when no route is eligible", async () => {
+    const root = await temporaryDirectory(); const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), "Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,Distance,Filename,Moving Time,Distance,Elevation Gain\ngpx-gap,Jan 1 2026 10:00:00 AM,Gapped Run,Run,600,11.2,activities/gpx-gap.gpx,600,11200,5\n");
+    await writeFile(join(exportDir, "activities", "gpx-gap.gpx"), "<?xml version=\"1.0\"?><gpx version=\"1.1\"><trk><trkseg><trkpt lat=\"37.1\" lon=\"-122.1\"><time>2026-01-01T18:00:00Z</time></trkpt><trkpt lat=\"37.101\" lon=\"-122.1\"><time>2026-01-01T18:00:10Z</time></trkpt><trkpt lat=\"37.2\" lon=\"-122.1\"><time>2026-01-01T18:10:00Z</time></trkpt></trkseg></trk></gpx>");
+    const { client } = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const splits = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-splits-missing", analysisType: "splits" } })));
+    const ineligible = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "gpx-gap", analysisType: "splits" } })));
+
+    // An ineligible route is answered, not refused: the catalog figures stand
+    // and the reason for the missing interval view is stated without location.
+    expect(ineligible).toMatchObject({ found: true, fellBackToCatalog: true, distanceSource: "none", routeQualityStatus: "ineligible" });
+    expect(ineligible.reason).toContain("discontinuity");
+    expect(ineligible.analysis.distanceMeters).toBe(11200);
+    expect(JSON.stringify(ineligible)).not.toContain("-122.1");
+    expect(splits).toMatchObject({ found: false });
     await client.close();
   });
 
@@ -219,7 +323,7 @@ describe("MCP server tool surface", () => {
     await client.callTool({ name: "import_detailed_activities", arguments: {} });
     const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1", fields: ["heartRate", "distanceMeters"] } })));
 
-    // One of two points has heart rate; GPX never supplies distance.
+    // One of two points has heart rate; this route is too short to normalize.
     expect(stream.fieldAvailability).toEqual({ heartRate: 1, distanceMeters: 0 });
     await client.close();
   });

@@ -5,17 +5,24 @@ import { resolve } from "node:path";
 import { createGunzip } from "node:zlib";
 import { SaxesParser } from "saxes";
 import type { Database } from "./database.js";
-import { elevationGainMeters } from "./elevation.js";
+import { elevationGainMeters, ELEVATION_NOISE_THRESHOLD_METERS } from "./elevation.js";
+import { normalizeRouteProgression, ROUTE_DISTANCE_DERIVATION_VERSION, type DistanceSource } from "./distance.js";
+import { deriveSplits, INTERVAL_METERS, SPLIT_DERIVATION_VERSION, type IntervalKind } from "./splits.js";
 import { logInternalError } from "./errors.js";
 import { simplifyToLimit } from "./geometry.js";
 import { fitOffsetMinutes, resolveActivityLocalTimes } from "./localtime.js";
 import { withinRoot } from "./paths.js";
 
+// A gzip member declares nothing about its expanded size, so decoding is
+// bounded on three axes rather than trusting the file: what is read, what it
+// expands to, and how far it expands. A single activity does not approach any
+// of these, so tripping one means the input is malformed or hostile, not that
+// a legitimate export was too large.
 const MAX_COMPRESSED_BYTES = 50 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = 200 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO = 100;
 
-export type StreamPoint = { timestamp: string | null; latitude: number | null; longitude: number | null; altitudeMeters: number | null; distanceMeters: number | null; heartRate: number | null; cadence: number | null; powerWatts: number | null; speedMetersPerSecond: number | null; sourcePayload?: Record<string, unknown> };
+export type StreamPoint = { timestamp: string | null; latitude: number | null; longitude: number | null; altitudeMeters: number | null; distanceMeters: number | null; distanceSource?: DistanceSource; heartRate: number | null; cadence: number | null; powerWatts: number | null; speedMetersPerSecond: number | null; sourcePayload?: Record<string, unknown> };
 export type Lap = { startedAt: string | null; durationSeconds: number | null; distanceMeters: number | null; elevationGainMeters: number | null; averageHeartRate: number | null; averageCadence: number | null; averagePowerWatts: number | null; sourcePayload?: Record<string, unknown> };
 type DetailedActivity = { format: "gpx" | "fit" | "fit.gz" | "tcx.gz"; points: StreamPoint[]; laps: Lap[]; utcOffsetMinutes: number | null };
 
@@ -148,14 +155,26 @@ async function decode(path: string, format: DetailedActivity["format"]): Promise
   return parseFit(path, format === "fit.gz");
 }
 
-// Sensor/GPS altitude jitters by less than this between samples; counting
-// every positive tick as "climbed" overstates gain against the source
-// figure. See elevation.ts for why this is a hysteresis band, not a
-// per-step gate.
-const ELEVATION_NOISE_THRESHOLD_METERS = 1;
+/** Bump when decoding changes what a file produces, so stored rows are known
+ * to be stale even though the source bytes are identical. */
+export const DECODER_VERSION = 1;
 
-export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string, timeZone?: string): Promise<object> {
-  const root = resolve(exportDir); const files = database.prepare(`SELECT id, activity_id AS activityId, relative_path AS relativePath FROM activity_files WHERE activity_id IS NOT NULL ${activityId === undefined ? "" : "AND activity_id = ?"}`).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string }[];
+export async function importDetailedActivityFiles(exportDir: string, database: Database, activityId?: string, timeZone?: string, force = false): Promise<object> {
+  const root = resolve(exportDir); const files = database.prepare(`
+    SELECT f.id, f.activity_id AS activityId, f.relative_path AS relativePath,
+      f.decode_status AS decodeStatus, f.decoded_sha256 AS decodedSha256,
+      f.decoder_version AS decoderVersion, f.distance_derivation_version AS derivationVersion, f.split_derivation_version AS splitVersion,
+      a.distance_meters AS catalogDistanceMeters,
+      (SELECT d.catalog_distance_meters FROM activity_distance_diagnostics d
+        WHERE d.activity_id = f.activity_id
+      ) AS derivedFromCatalogDistance,
+      (SELECT m.sha256 FROM source_manifest m
+        WHERE m.relative_path = f.relative_path
+          AND m.snapshot_id = (SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1)
+      ) AS currentSha256
+    FROM activity_files f JOIN activities a ON a.id = f.activity_id
+    WHERE f.activity_id IS NOT NULL ${activityId === undefined ? "" : "AND f.activity_id = ?"}
+  `).all(...(activityId === undefined ? [] : [activityId])) as { id: number; activityId: string; relativePath: string; decodeStatus: string | null; decodedSha256: string | null; decoderVersion: number | null; derivationVersion: number | null; splitVersion: number | null; catalogDistanceMeters: number | null; derivedFromCatalogDistance: number | null; currentSha256: string | null }[];
   // A file's detail row can outlive the source that produced it — an export
   // may drop a file between snapshots. Decoding only proceeds for paths the
   // latest validation actually observed, not merely ones once recorded.
@@ -163,7 +182,7 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
     SELECT relative_path AS relativePath FROM source_manifest
     WHERE snapshot_id = (SELECT id FROM export_snapshots WHERE outcome != 'running' ORDER BY id DESC LIMIT 1)
   `).all() as { relativePath: string }[]).map((row) => row.relativePath));
-  const results: { activityId: string; status: "decoded" | "skipped" | "failed"; pointCount?: number; lapCount?: number; utcOffsetMinutes?: number | null; error?: string }[] = [];
+  const results: { activityId: string; status: "decoded" | "unchanged" | "skipped" | "failed"; pointCount?: number; lapCount?: number; utcOffsetMinutes?: number | null; error?: string }[] = [];
   for (const file of files) {
     const format = formatFor(file.relativePath); const path = resolve(root, file.relativePath);
     // Decode status and the decoded offset are facts about one file, so every
@@ -173,36 +192,68 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
       results.push({ activityId: file.activityId, status: "skipped" });
       continue;
     }
+    // Re-decoding identical bytes under unchanged formulas would rewrite the
+    // same rows. A null checksum on either side means provenance is unknown,
+    // so the file is decoded rather than assumed current.
+    //
+    // The catalog total is an input to the derivation, not just to the file:
+    // a catalog-normalized route scales its progression to it, and a route
+    // previously rejected for having no catalog distance becomes eligible once
+    // one exists. A re-export can change that total while leaving the linked
+    // file byte-identical, so the distance the stored rows were derived from
+    // is compared too, or those rows would keep a total the catalog no longer
+    // reports.
+    const current = file.currentSha256;
+    if (!force && file.decodeStatus === "decoded" && current !== null && file.decodedSha256 === current
+      && file.decoderVersion === DECODER_VERSION && file.derivationVersion === ROUTE_DISTANCE_DERIVATION_VERSION
+      && file.splitVersion === SPLIT_DERIVATION_VERSION
+      && file.derivedFromCatalogDistance === file.catalogDistanceMeters) {
+      results.push({ activityId: file.activityId, status: "unchanged" });
+      continue;
+    }
     try {
-      const detailed = await decode(path, format); const now = new Date().toISOString();
+      const decoded = await decode(path, format);
+      const route = normalizeRouteProgression(decoded.points, file.catalogDistanceMeters);
+      const detailed = { ...decoded, points: route.points }; const now = new Date().toISOString();
       const write = database.transaction(() => {
         database.prepare("DELETE FROM activity_streams WHERE activity_id = ?").run(file.activityId); database.prepare("DELETE FROM activity_laps WHERE activity_id = ?").run(file.activityId);
-        const stream = database.prepare("INSERT INTO activity_streams (activity_id, sequence, timestamp, latitude, longitude, altitude_meters, distance_meters, heart_rate, cadence, power_watts, speed_meters_per_second, source_payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-        detailed.points.forEach((point, sequence) => stream.run(file.activityId, sequence, point.timestamp, point.latitude, point.longitude, point.altitudeMeters, point.distanceMeters, point.heartRate, point.cadence, point.powerWatts, point.speedMetersPerSecond, point.sourcePayload === undefined ? null : JSON.stringify(point.sourcePayload)));
+        const stream = database.prepare("INSERT INTO activity_streams (activity_id, sequence, timestamp, latitude, longitude, altitude_meters, distance_meters, distance_source, heart_rate, cadence, power_watts, speed_meters_per_second, source_payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        detailed.points.forEach((point, sequence) => stream.run(file.activityId, sequence, point.timestamp, point.latitude, point.longitude, point.altitudeMeters, point.distanceMeters, point.distanceSource, point.heartRate, point.cadence, point.powerWatts, point.speedMetersPerSecond, point.sourcePayload === undefined ? null : JSON.stringify(point.sourcePayload)));
         const lap = database.prepare("INSERT INTO activity_laps (activity_id, sequence, started_at, duration_seconds, distance_meters, elevation_gain_meters, average_heart_rate, average_cadence, average_power_watts, source_payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         detailed.laps.forEach((item, sequence) => lap.run(file.activityId, sequence, item.startedAt, item.durationSeconds, item.distanceMeters, item.elevationGainMeters, item.averageHeartRate, item.averageCadence, item.averagePowerWatts, item.sourcePayload === undefined ? null : JSON.stringify(item.sourcePayload)));
         const bounds = database.prepare(`
           SELECT COUNT(*) AS pointCount, MIN(timestamp) AS startedAt, MAX(timestamp) AS endedAt,
             MIN(latitude) AS minLatitude, MIN(longitude) AS minLongitude, MAX(latitude) AS maxLatitude, MAX(longitude) AS maxLongitude,
-            MAX(distance_meters) AS totalDistanceMeters
+            MAX(distance_meters) AS totalDistanceMeters,
+            COALESCE((SELECT distance_source FROM activity_streams WHERE activity_id = ? AND distance_meters IS NOT NULL ORDER BY sequence DESC LIMIT 1), 'none') AS distanceSource
           FROM activity_streams WHERE activity_id = ?
-        `).get(file.activityId) as Record<string, unknown>;
+        `).get(file.activityId, file.activityId) as Record<string, unknown>;
         // Hysteresis needs the ordered series itself, not an aggregate SQL can
         // express in one pass — see elevation.ts.
         const altitudes = (database.prepare("SELECT altitude_meters AS altitude FROM activity_streams WHERE activity_id = ? ORDER BY sequence").all(file.activityId) as { altitude: number | null }[]).map((row) => row.altitude);
         const gain = elevationGainMeters(altitudes, ELEVATION_NOISE_THRESHOLD_METERS);
-        database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, gain, bounds.minLatitude === null ? 0 : 1, now);
-        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, file.id);
+        database.prepare("INSERT OR REPLACE INTO activity_bounds (activity_id, point_count, started_at, ended_at, min_latitude, min_longitude, max_latitude, max_longitude, total_distance_meters, distance_source, elevation_gain_meters, has_location, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, bounds.pointCount, bounds.startedAt, bounds.endedAt, bounds.minLatitude, bounds.minLongitude, bounds.maxLatitude, bounds.maxLongitude, bounds.totalDistanceMeters, bounds.distanceSource, gain, bounds.minLatitude === null ? 0 : 1, now);
+        database.prepare("INSERT OR REPLACE INTO activity_distance_diagnostics (activity_id, derivation_version, raw_gps_distance_meters, catalog_distance_meters, error_ratio, total_point_count, valid_coordinate_point_count, timestamped_point_count, major_gap_count, quality_status, withheld_reason, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").run(file.activityId, ROUTE_DISTANCE_DERIVATION_VERSION, route.diagnostic.rawGpsDistanceMeters, route.diagnostic.catalogDistanceMeters, route.diagnostic.errorRatio, route.diagnostic.totalPointCount, route.diagnostic.validCoordinatePointCount, route.diagnostic.timestampedPointCount, route.diagnostic.majorGapCount, route.diagnostic.qualityStatus, route.diagnostic.withheldReason, now);
+        database.prepare("DELETE FROM activity_splits WHERE activity_id = ?").run(file.activityId);
+        const splitRow = database.prepare("INSERT INTO activity_splits (activity_id, interval_kind, interval_meters, sequence, derivation_version, distance_source, start_distance_meters, end_distance_meters, distance_meters, complete, started_at, ended_at, elapsed_seconds, moving_seconds, paused_seconds, pause_count, recording_gap_count, pace_seconds_per_km, average_heart_rate, max_heart_rate, average_cadence, average_power_watts, elevation_gain_meters, elevation_loss_meters, point_count, metrics_available_json, computed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        const streamSource = String(bounds.distanceSource) as DistanceSource;
+        for (const intervalKind of ["km", "mile"] as IntervalKind[]) {
+          const derived = deriveSplits(detailed.points, intervalKind, streamSource);
+          for (const split of derived.splits) {
+            splitRow.run(file.activityId, intervalKind, INTERVAL_METERS[intervalKind], split.sequence, SPLIT_DERIVATION_VERSION, streamSource, split.startDistanceMeters, split.endDistanceMeters, split.distanceMeters, split.complete ? 1 : 0, split.startedAt, split.endedAt, split.elapsedSeconds, split.movingSeconds, split.pausedSeconds, split.pauseCount, split.recordingGapCount, split.paceSecondsPerKm, split.averageHeartRate, split.maxHeartRate, split.averageCadence, split.averagePowerWatts, split.elevationGainMeters, split.elevationLossMeters, split.pointCount, JSON.stringify(split.metricsAvailable), now);
+          }
+        }
+        database.prepare("UPDATE activity_files SET format = ?, decode_status = 'decoded', parse_error = NULL, utc_offset_minutes = ?, decoded_sha256 = ?, decoder_version = ?, distance_derivation_version = ?, split_derivation_version = ?, decoded_at = ? WHERE id = ?").run(format, detailed.utcOffsetMinutes, current, DECODER_VERSION, ROUTE_DISTANCE_DERIVATION_VERSION, SPLIT_DERIVATION_VERSION, now, file.id);
       }); write(); results.push({ activityId: file.activityId, status: "decoded", pointCount: detailed.points.length, lapCount: detailed.laps.length, utcOffsetMinutes: detailed.utcOffsetMinutes });
     } catch (error) {
       logInternalError(`decoding ${file.relativePath}`, error);
-      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ? WHERE id = ?").run("Detailed file could not be decoded", file.id);
+      database.prepare("UPDATE activity_files SET decode_status = 'failed', parse_error = ?, decoded_sha256 = NULL, decoder_version = NULL, distance_derivation_version = NULL, split_derivation_version = NULL WHERE id = ?").run("Detailed file could not be decoded", file.id);
       results.push({ activityId: file.activityId, status: "failed", error: "Detailed file could not be decoded" });
     }
   }
   // A newly decoded FIT offset supersedes the configured-zone fallback.
   const coverage = resolveActivityLocalTimes(database, timeZone);
-  return { decoded: results.filter((result) => result.status === "decoded").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, offsetCoverage: coverage, results };
+  return { decoded: results.filter((result) => result.status === "decoded").length, unchanged: results.filter((result) => result.status === "unchanged").length, failed: results.filter((result) => result.status === "failed").length, skipped: results.filter((result) => result.status === "skipped").length, offsetCoverage: coverage, results };
 }
 
 /**
@@ -210,9 +261,15 @@ export async function importDetailedActivityFiles(exportDir: string, database: D
  * supplies and TCX supplies only per lap: 222 of the 325 activities in the
  * reference export have none. The catalog carries a total for every activity,
  * so it is the fallback, and the source is always stated.
+ *
+ * The catalog's own elapsed time is not a usable cross-check against a
+ * stream: it counts time the device was not recording, so for a track with
+ * auto-pause or a stopped recording it can exceed the span between the first
+ * and last point by a wide margin. Compare against the track span, or against
+ * the catalog's moving time, but never against its elapsed time.
  */
-export function resolveTotalDistance(streamDistance: number | null, catalogDistance: number | null): { meters: number | null; source: "stream" | "catalog" | "none" } {
-  if (streamDistance !== null) return { meters: streamDistance, source: "stream" };
+export function resolveTotalDistance(streamDistance: number | null, catalogDistance: number | null, streamSource: DistanceSource = "none"): { meters: number | null; source: DistanceSource | "catalog" | "none" } {
+  if (streamDistance !== null) return { meters: streamDistance, source: streamSource };
   if (catalogDistance !== null) return { meters: catalogDistance, source: "catalog" };
   return { meters: null, source: "none" };
 }
@@ -220,8 +277,8 @@ export function resolveTotalDistance(streamDistance: number | null, catalogDista
 const LOCATION_FIELDS = new Set(["latitude", "longitude"]);
 
 export function getActivityStream(database: Database, activityId: string, fields: readonly string[], includeLocation: boolean, maxPoints: number, startTime?: string, endTime?: string): object {
-  const allowed = { timestamp: "timestamp", altitudeMeters: "altitude_meters", distanceMeters: "distance_meters", heartRate: "heart_rate", cadence: "cadence", powerWatts: "power_watts", speedMetersPerSecond: "speed_meters_per_second", latitude: "latitude", longitude: "longitude" } as const;
-  const requested = fields.length ? fields : ["timestamp", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond"];
+  const allowed = { timestamp: "timestamp", altitudeMeters: "altitude_meters", distanceMeters: "distance_meters", distanceSource: "distance_source", heartRate: "heart_rate", cadence: "cadence", powerWatts: "power_watts", speedMetersPerSecond: "speed_meters_per_second", latitude: "latitude", longitude: "longitude" } as const;
+  const requested = fields.length ? fields : ["timestamp", "distanceMeters", "distanceSource", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond"];
   const permitted = requested.filter((field): field is keyof typeof allowed => field in allowed);
   // Naming a coordinate field is not consent to receive it: exact location
   // requires the explicit per-request opt-in, and it is never carried over.
@@ -250,13 +307,13 @@ const DEFAULT_ROUTE_TOLERANCE_METERS = 5;
 export function getActivityRoute(database: Database, activityId: string, includeLocation: boolean, maxPoints: number): object {
   const stored = database.prepare(`
     SELECT b.point_count AS pointCount, b.started_at AS startedAt, b.ended_at AS endedAt,
-      b.total_distance_meters AS streamDistanceMeters, a.distance_meters AS catalogDistanceMeters,
+      b.total_distance_meters AS streamDistanceMeters, b.distance_source AS streamDistanceSource, a.distance_meters AS catalogDistanceMeters,
       b.elevation_gain_meters AS elevationGainMeters, b.has_location AS hasLocation
     FROM activity_bounds b LEFT JOIN activities a ON a.id = b.activity_id WHERE b.activity_id = ?
-  `).get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; catalogDistanceMeters: number | null; elevationGainMeters: number | null; hasLocation: number } | undefined;
+  `).get(activityId) as { pointCount: number; startedAt: string | null; endedAt: string | null; streamDistanceMeters: number | null; streamDistanceSource: DistanceSource; catalogDistanceMeters: number | null; elevationGainMeters: number | null; hasLocation: number } | undefined;
   if (stored === undefined) return { activityId, available: false, message: "No detailed route has been imported for this activity." };
-  const { streamDistanceMeters, catalogDistanceMeters, ...rest } = stored;
-  const distance = resolveTotalDistance(streamDistanceMeters, catalogDistanceMeters);
+  const { streamDistanceMeters, streamDistanceSource, catalogDistanceMeters, ...rest } = stored;
+  const distance = resolveTotalDistance(streamDistanceMeters, catalogDistanceMeters, streamDistanceSource);
   const bounds = { ...rest, totalDistanceMeters: distance.meters, totalDistanceSource: distance.source };
   // elevationGainMeters here is computed from device altitude with basic
   // hysteresis smoothing, not Strava's own corrected figure; the two can

@@ -4,11 +4,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 import { Encoder } from "@garmin/fitsdk";
+import Sqlite from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadConfig, type ServerConfig } from "../src/config.js";
-import { createServer } from "../src/server.js";
+import { loadConfig, type ServerConfig } from "../../src/config.js";
+import { createServer } from "../../src/server.js";
 
 const temporaryRoots: string[] = [];
 
@@ -35,7 +36,7 @@ async function connectedClient(config: ServerConfig): Promise<Client> {
 async function copiedFixture(name: string): Promise<{ exportDir: string; dataDir: string }> {
   const root = await temporaryDirectory();
   const exportDir = join(root, "export");
-  await cp(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)), exportDir, { recursive: true });
+  await cp(fileURLToPath(new URL(`../fixtures/${name}`, import.meta.url)), exportDir, { recursive: true });
   return { exportDir, dataDir: join(root, "cache") };
 }
 
@@ -46,6 +47,21 @@ function syntheticFit(utc: Date): Uint8Array {
   encoder.writeMesg({ mesgNum: 20, timestamp: utc, positionLat: 450000000, positionLong: -1460000000, distance: 0, heartRate: 120, altitude: 10 });
   encoder.writeMesg({ mesgNum: 20, timestamp: new Date(utc.valueOf() + 60_000), positionLat: 450001000, positionLong: -1460001000, distance: 200, heartRate: 140, altitude: 15 });
   encoder.writeMesg({ mesgNum: 19, timestamp: new Date(utc.valueOf() + 60_000), startTime: utc, totalTimerTime: 60, totalDistance: 200, avgHeartRate: 130 });
+  encoder.writeMesg({ mesgNum: 34, timestamp: utc, localTimestamp: utc.valueOf() / 1000 - 631_065_600, numSessions: 1, type: "manual", event: "activity", eventType: "stop" });
+  return encoder.close();
+}
+
+/** A longer FIT track, so supplied distance spans whole split boundaries. */
+function syntheticFitTrack(utc: Date, seconds: number, metersPerSecond: number): Uint8Array {
+  const encoder = new Encoder();
+  encoder.writeMesg({ mesgNum: 0, type: "activity", manufacturer: "garmin", product: 1, timeCreated: utc, serialNumber: 1 });
+  for (let second = 0; second <= seconds; second += 1) {
+    encoder.writeMesg({
+      mesgNum: 20, timestamp: new Date(utc.valueOf() + second * 1_000),
+      positionLat: 450000000 + second * 1_000, positionLong: -1460000000,
+      distance: second * metersPerSecond, heartRate: 140, cadence: 85, altitude: 10 + (second % 20),
+    });
+  }
   encoder.writeMesg({ mesgNum: 34, timestamp: utc, localTimestamp: utc.valueOf() / 1000 - 631_065_600, numSessions: 1, type: "manual", event: "activity", eventType: "stop" });
   return encoder.close();
 }
@@ -119,6 +135,108 @@ describe("Detailed import resilience", () => {
     expect(byId["broken-1"]).toMatchObject({ status: "failed" });
     // The failure is reported without the decoder's raw message.
     expect(byId["broken-1"].error).toBe("Detailed file could not be decoded");
+  });
+
+  it("leaves an unchanged file alone on re-import and re-decodes only on demand", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\ngpx-1,"Jan 2, 2026, 7:00:00 AM",GPX,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n`);
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.2" lon="-122.2"><time>2026-01-02T15:01:00Z</time></trkpt></trkseg></trk></gpx>`);
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    const first = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const second = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const forced = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: { force: true } })));
+    await client.close();
+
+    expect(first).toMatchObject({ decoded: 1, unchanged: 0 });
+    // The bytes and both versions are identical, so there is nothing to redo.
+    expect(second).toMatchObject({ decoded: 0, unchanged: 1 });
+    expect(forced).toMatchObject({ decoded: 1, unchanged: 0 });
+  });
+
+  it("re-decodes a file whose bytes changed since the last import", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\ngpx-1,"Jan 2, 2026, 7:00:00 AM",GPX,Run,120,0.1,activities/gpx-1.gpx,110,100,5\n`);
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt></trkseg></trk></gpx>`);
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    // A fresh export of the same activity, with one more recorded point.
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.2" lon="-122.2"><time>2026-01-02T15:01:00Z</time></trkpt></trkseg></trk></gpx>`);
+    await client.callTool({ name: "validate_export", arguments: {} });
+    const reimported = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const stream = JSON.parse(textContent(await client.callTool({ name: "get_activity_stream", arguments: { activityId: "gpx-1" } })));
+    await client.close();
+
+    expect(reimported).toMatchObject({ decoded: 1, unchanged: 0 });
+    expect(stream.totalPoints).toBe(2);
+  });
+
+  it("re-derives when the catalog distance changes under an unchanged file", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    const track = `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.100" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.101" lon="-122.1"><time>2026-01-02T15:00:10Z</time></trkpt><trkpt lat="37.102" lon="-122.1"><time>2026-01-02T15:00:20Z</time></trkpt></trkseg></trk></gpx>`;
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), track);
+    const catalog = (km: string, meters: string) => `${CATALOG_HEADER}\ngpx-1,"Jan 2, 2026, 7:00:00 AM",GPX,Run,120,${km},activities/gpx-1.gpx,110,${meters},5\n`;
+    await writeFile(join(exportDir, "activities.csv"), catalog("0.2224", "222.4"));
+
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const before = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-1" } })));
+
+    // A fresh export restates the activity at a different distance while the
+    // linked file is byte-identical, which is what Strava recalculating a
+    // distance looks like on disk.
+    await writeFile(join(exportDir, "activities.csv"), catalog("0.3", "300"));
+    await client.callTool({ name: "validate_export", arguments: {} });
+    await client.callTool({ name: "import_activity_catalog", arguments: { revalidate: false } });
+    const reimported = JSON.parse(textContent(await client.callTool({ name: "import_detailed_activities", arguments: {} })));
+    const after = JSON.parse(textContent(await client.callTool({ name: "get_activity", arguments: { activityId: "gpx-1" } })));
+    await client.close();
+
+    expect(before.derived).toMatchObject({ totalDistanceMeters: 222.4, totalDistanceSource: "catalog-normalized-path" });
+    // The bytes did not change, but what they are normalized against did.
+    expect(reimported).toMatchObject({ decoded: 1, unchanged: 0 });
+    expect(after.derived).toMatchObject({ totalDistanceMeters: 300, totalDistanceSource: "catalog-normalized-path" });
+  });
+
+  it("recomputes only the records a derivation-version bump affects", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export"); const dataDir = join(root, "cache");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    const rows = [
+      `gpx-1,"Jan 2, 2026, 7:00:00 AM",One,Run,120,0.1,activities/gpx-1.gpx,110,100,5`,
+      `gpx-2,"Jan 3, 2026, 7:00:00 AM",Two,Run,120,0.1,activities/gpx-2.gpx,110,100,5`,
+    ].join("\n");
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\n${rows}\n`);
+    const track = `<?xml version="1.0"?><gpx version="1.1"><trk><trkseg><trkpt lat="37.1" lon="-122.1"><time>2026-01-02T15:00:00Z</time></trkpt><trkpt lat="37.2" lon="-122.2"><time>2026-01-02T15:01:00Z</time></trkpt></trkseg></trk></gpx>`;
+    await writeFile(join(exportDir, "activities", "gpx-1.gpx"), track);
+    await writeFile(join(exportDir, "activities", "gpx-2.gpx"), track.replace("37.2", "37.3"));
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: dataDir }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    await client.close();
+
+    // Stand in for a formula change by ageing one activity's stored version,
+    // which is exactly what a bumped constant does to every stored row.
+    const raw = new Sqlite(join(dataDir, "strava.sqlite"));
+    raw.prepare("UPDATE activity_files SET distance_derivation_version = 0 WHERE activity_id = 'gpx-1'").run();
+    raw.close();
+
+    const reconnected = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: dataDir }));
+    const recomputed = JSON.parse(textContent(await reconnected.callTool({ name: "import_detailed_activities", arguments: {} })));
+    await reconnected.close();
+
+    const byId = Object.fromEntries(recomputed.results.map((result: { activityId: string }) => [result.activityId, result]));
+    expect(recomputed).toMatchObject({ decoded: 1, unchanged: 1 });
+    expect(byId["gpx-1"]).toMatchObject({ status: "decoded" });
+    expect(byId["gpx-2"]).toMatchObject({ status: "unchanged" });
   });
 
   it("re-imports detailed files without duplicating stream points", async () => {
@@ -200,5 +318,48 @@ describe("Privacy defaults across the tool surface", () => {
 
     expect(leaked).toEqual([]);
     expect(opted).toContain("47.637626");
+  });
+});
+
+describe("Telemetry analysis end to end", () => {
+  it("derives splits from file-supplied distance and labels them as recorded", async () => {
+    const root = await temporaryDirectory();
+    const exportDir = join(root, "export");
+    await mkdir(join(exportDir, "activities"), { recursive: true });
+    await writeFile(join(exportDir, "activities.csv"), `${CATALOG_HEADER}\nfit-splits,"Jan 3, 2026, 7:00:00 AM",FIT,Run,1200,2.4,activities/fit-splits.fit,1200,2400,10\n`);
+    // 2,400 m at 2 m/s: two whole kilometres and a partial third.
+    await writeFile(join(exportDir, "activities", "fit-splits.fit"), syntheticFitTrack(new Date("2026-01-03T15:00:00Z"), 1_200, 2));
+
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: join(root, "cache") }));
+    await client.callTool({ name: "import_activity_catalog", arguments: {} });
+    await client.callTool({ name: "import_detailed_activities", arguments: {} });
+    const splits = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "fit-splits", analysisType: "splits" } })));
+    const progression = JSON.parse(textContent(await client.callTool({ name: "analyze_activity", arguments: { activityId: "fit-splits", analysisType: "progression" } })));
+    await client.close();
+
+    expect(splits).toMatchObject({ found: true, distanceSource: "supplied", intervalKind: "km" });
+    // Supplied distance is used as recorded, never normalized to the catalog.
+    expect(splits.boundaryBasis).toContain("recorded");
+    expect(splits.boundaryBasis).not.toContain("normalized");
+    expect(splits.analysis.splits).toHaveLength(3);
+    expect(splits.analysis.splits[0]).toMatchObject({ complete: true, distanceMeters: 1_000 });
+    expect(splits.analysis.splits[0].paceSecondsPerKm).toBeCloseTo(500, 0);
+    expect(splits.analysis.splits[0].metricsAvailable).toEqual(expect.arrayContaining(["heartRate", "cadence", "elevation"]));
+    // Steady pace throughout, so the first and last complete splits match.
+    expect(progression.analysis.paceDriftSecondsPerKm).toBeCloseTo(0, 0);
+  });
+
+  it("publishes the split domain through the data schema", async () => {
+    const { exportDir, dataDir } = await copiedFixture("minimal-export");
+    const client = await connectedClient(loadConfig({ STRAVA_EXPORT_DIR: exportDir, STRAVA_MCP_DATA_DIR: dataDir }));
+    const schema = JSON.parse(textContent(await client.callTool({ name: "get_data_schema", arguments: { domain: "splits" } })));
+    await client.close();
+
+    expect(schema.splits).toMatchObject({ currentState: "activity_splits", queryTool: "analyze_activity", intervals: ["km", "mile"] });
+    const names = schema.splits.fields.map((field: { name: string }) => field.name);
+    expect(names).toEqual(expect.arrayContaining(["paceSecondsPerKm", "pausedSeconds", "recordingGapCount", "distanceSource", "metricsAvailable"]));
+    // A split is a derived metric, never a place.
+    expect(names).not.toContain("latitude");
+    expect(names).not.toContain("longitude");
   });
 });

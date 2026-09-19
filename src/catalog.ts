@@ -7,9 +7,10 @@ import { normalizeMatchKey } from "./identity.js";
 import { resolveActivityLocalTimes, type OffsetCoverage } from "./localtime.js";
 import { parseCsv } from "./validator.js";
 
-/** Version 3 reads `Activity Date` as UTC and version 4 adds `Activity Gear`;
+/** Version 3 reads `Activity Date` as UTC, version 4 adds `Activity Gear`, and
+ * version 5 adds the pipe-delimited `Media` column;
  * bumping it re-imports stored rows. */
-export const ACTIVITY_CATALOG_COLUMN_MAP_VERSION = 4;
+export const ACTIVITY_CATALOG_COLUMN_MAP_VERSION = 5;
 
 export type ColumnType = "string" | "number" | "integer" | "boolean" | "date";
 export type ColumnDefinition = Readonly<{
@@ -43,6 +44,7 @@ export const ACTIVITY_CATALOG_COLUMNS_V1: readonly ColumnDefinition[] = [
   { field: "intensity", sourceHeader: "Intensity", occurrence: 1, type: "number" },
   { field: "commute", sourceHeader: "Commute", occurrence: 1, type: "boolean" },
   { field: "gearName", sourceHeader: "Activity Gear", occurrence: 1, type: "string" },
+  { field: "mediaRefs", sourceHeader: "Media", occurrence: 1, type: "string" },
 ];
 
 export type PositionalColumn = Readonly<{
@@ -115,8 +117,8 @@ function parseBoolean(value: string | undefined): boolean | null {
 
 /**
  * Export timestamps are UTC but carry no zone marker: a catalog value of
- * `Mar 27, 2026, 1:28:59 AM` is the same instant as its linked GPX
- * `2026-03-27T01:28:59Z`. A lenient `new Date` resolves that format in the
+ * `Sep 12, 2026, 2:15:00 AM` is the same instant as a linked GPX
+ * `2026-09-12T02:15:00Z`. A lenient `new Date` resolves that format in the
  * host's zone, which would make the stored instant depend on where the
  * importer ran. Commas are optional because not every export writes them.
  */
@@ -140,6 +142,12 @@ function parseExportDate(match: RegExpExecArray): string | null {
   // Date.UTC rolls impossible components over instead of rejecting them, so a
   // value such as `Feb 30` must be caught by comparing the result back.
   return instant.getUTCMonth() === month && instant.getUTCDate() === day ? instant.toISOString() : null;
+}
+
+/** Exported so supporting domains parse the export's date format identically
+ * rather than each inventing their own. */
+export function parseExportTimestamp(value: string | undefined): string | null {
+  return parseDate(value);
 }
 
 function parseDate(value: string | undefined): string | null {
@@ -238,11 +246,11 @@ export async function importActivityCatalog(
     `);
     const existing = database.prepare("SELECT catalog_row_hash, catalog_map_version FROM activities WHERE id = ?");
     const insertActivity = database.prepare(`
-      INSERT INTO activities (id, catalog_filename, sport_type, started_at, duration_seconds, distance_meters, available, catalog_row_hash, catalog_map_version, first_seen_snapshot_id, last_seen_snapshot_id, last_observed_at, observation_status, name, description, moving_seconds, distance_miles, elevation_gain_meters, average_heart_rate, average_watts, relative_effort, training_load, intensity, commute, gear_name, gear_match_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO activities (id, catalog_filename, sport_type, started_at, duration_seconds, distance_meters, available, catalog_row_hash, catalog_map_version, first_seen_snapshot_id, last_seen_snapshot_id, last_observed_at, observation_status, name, description, moving_seconds, distance_miles, elevation_gain_meters, average_heart_rate, average_watts, relative_effort, training_load, intensity, commute, gear_name, gear_match_key, media_refs)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const updateActivity = database.prepare(`
-      UPDATE activities SET catalog_filename = ?, sport_type = ?, started_at = ?, duration_seconds = ?, distance_meters = ?, available = 1, catalog_row_hash = ?, catalog_map_version = ?, last_seen_snapshot_id = ?, last_observed_at = ?, observation_status = 'observed', name = ?, description = ?, moving_seconds = ?, distance_miles = ?, elevation_gain_meters = ?, average_heart_rate = ?, average_watts = ?, relative_effort = ?, training_load = ?, intensity = ?, commute = ?, gear_name = ?, gear_match_key = ?
+      UPDATE activities SET catalog_filename = ?, sport_type = ?, started_at = ?, duration_seconds = ?, distance_meters = ?, available = 1, catalog_row_hash = ?, catalog_map_version = ?, last_seen_snapshot_id = ?, last_observed_at = ?, observation_status = 'observed', name = ?, description = ?, moving_seconds = ?, distance_miles = ?, elevation_gain_meters = ?, average_heart_rate = ?, average_watts = ?, relative_effort = ?, training_load = ?, intensity = ?, commute = ?, gear_name = ?, gear_match_key = ?, media_refs = ?
       WHERE id = ?
     `);
     const observeUnchanged = database.prepare("UPDATE activities SET last_seen_snapshot_id = ?, last_observed_at = ?, observation_status = 'observed' WHERE id = ?");
@@ -266,15 +274,18 @@ export async function importActivityCatalog(
       // normalized here into the key the gear domain joins on.
       const gearName = value<string>(row, "gearName");
       const gearKey = gearName === null ? null : normalizeMatchKey(gearName);
+      // Kept as the raw pipe-delimited string. Splitting and path validation
+      // belong to the media import, which owns the approved-root rules.
+      const mediaRefs = value<string>(row, "mediaRefs");
       const prior = existing.get(activityId) as { catalog_row_hash: string | null; catalog_map_version: number | null } | undefined;
       if (prior === undefined) {
-        insertActivity.run(activityId, value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), 1, row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, snapshotId, now, "observed", value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<number>(row, "trainingLoad"), value<number>(row, "intensity"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0, gearName, gearKey);
+        insertActivity.run(activityId, value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), 1, row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, snapshotId, now, "observed", value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<number>(row, "trainingLoad"), value<number>(row, "intensity"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0, gearName, gearKey, mediaRefs);
         inserted += 1;
       } else if (prior.catalog_row_hash === row.rowHash && prior.catalog_map_version === ACTIVITY_CATALOG_COLUMN_MAP_VERSION) {
         observeUnchanged.run(snapshotId, now, activityId);
         unchanged += 1;
       } else {
-        updateActivity.run(value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, now, value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<number>(row, "trainingLoad"), value<number>(row, "intensity"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0, gearName, gearKey, activityId);
+        updateActivity.run(value<string>(row, "catalogFilename"), value<string>(row, "sportType"), value<string>(row, "startedAt"), value<number>(row, "elapsedSeconds"), value<number>(row, "distanceMeters"), row.rowHash, ACTIVITY_CATALOG_COLUMN_MAP_VERSION, snapshotId, now, value<string>(row, "name"), value<string>(row, "description"), value<number>(row, "movingSeconds"), value<number>(row, "distanceMiles"), value<number>(row, "elevationGainMeters"), value<number>(row, "averageHeartRate"), value<number>(row, "averageWatts"), value<number>(row, "relativeEffort"), value<number>(row, "trainingLoad"), value<number>(row, "intensity"), value<boolean>(row, "commute") === null ? null : value<boolean>(row, "commute") ? 1 : 0, gearName, gearKey, mediaRefs, activityId);
         changed += 1;
       }
       const catalogFilename = value<string>(row, "catalogFilename");

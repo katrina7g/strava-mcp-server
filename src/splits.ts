@@ -1,0 +1,236 @@
+import { elevationChangeMeters, ELEVATION_NOISE_THRESHOLD_METERS } from "./elevation.js";
+import type { DistanceSource } from "./distance.js";
+
+/** Bump when the split formula changes, so stored splits recompute. */
+export const SPLIT_DERIVATION_VERSION = 1;
+
+export type IntervalKind = "km" | "mile";
+// Both series are derived and stored for every activity rather than converted
+// on demand, because a mile boundary falls inside a kilometre split and its
+// per-interval metrics cannot be recovered by scaling the kilometre figures.
+export const INTERVAL_METERS: Record<IntervalKind, number> = { km: 1_000, mile: 1_609.344 };
+
+// A pause is defined by speed, not by sampling rate. Treating any gap over
+// thirty seconds as a pause outright would mark a sparsely sampled track as
+// entirely stopped — a GPX logging every two hundred seconds at running speed
+// would report no moving time at all. Standing still is caught by the speed
+// test whether or not the device kept sampling. A long gap that does cover
+// ground is a hole in the recording rather than a rest, so it is counted and
+// reported separately instead of being silently folded into either total.
+const PAUSE_SPEED_METERS_PER_SECOND = 0.5;
+const RECORDING_GAP_SECONDS = 30;
+// Speed crosses the pause threshold repeatedly when someone shuffles at a
+// start line or a GPS fix wanders, so counting every crossing turns one slow
+// stretch into hundreds of stops. A stop has to last to be a stop. The time
+// still accrues to pausedSeconds from the first slow sample: this bounds what
+// counts as an interruption, not what counts as stopped.
+const MIN_PAUSE_SECONDS = 5;
+
+export type SplitPoint = {
+  timestamp: string | null;
+  distanceMeters: number | null;
+  altitudeMeters: number | null;
+  heartRate: number | null;
+  cadence: number | null;
+  powerWatts: number | null;
+};
+
+export type Split = {
+  sequence: number;
+  startDistanceMeters: number;
+  endDistanceMeters: number;
+  distanceMeters: number;
+  complete: boolean;
+  startedAt: string | null;
+  endedAt: string | null;
+  elapsedSeconds: number | null;
+  movingSeconds: number | null;
+  pausedSeconds: number;
+  pauseCount: number;
+  recordingGapCount: number;
+  paceSecondsPerKm: number | null;
+  averageHeartRate: number | null;
+  maxHeartRate: number | null;
+  averageCadence: number | null;
+  averagePowerWatts: number | null;
+  elevationGainMeters: number | null;
+  elevationLossMeters: number | null;
+  pointCount: number;
+  /** Named so a caller can tell an absent metric from a zero reading. */
+  metricsAvailable: string[];
+};
+
+export type SplitDerivation = {
+  splits: Split[];
+  intervalKind: IntervalKind;
+  intervalMeters: number;
+  distanceSource: DistanceSource;
+  totalDistanceMeters: number | null;
+  withheldReason: string | null;
+};
+
+function millis(timestamp: string | null): number | null {
+  if (timestamp === null) return null;
+  const value = Date.parse(timestamp);
+  return Number.isFinite(value) ? value : null;
+}
+
+function average(values: readonly number[]): number | null {
+  return values.length === 0 ? null : values.reduce((total, value) => total + value, 0) / values.length;
+}
+
+type Accumulator = {
+  elapsedSeconds: number; pausedSeconds: number; pauseCount: number; recordingGapCount: number;
+  firstTime: number | null; lastTime: number | null;
+  altitudes: (number | null)[]; heartRates: number[]; cadences: number[]; powers: number[];
+  pointCount: number;
+};
+
+function emptyAccumulator(): Accumulator {
+  return { elapsedSeconds: 0, pausedSeconds: 0, pauseCount: 0, recordingGapCount: 0, firstTime: null, lastTime: null, altitudes: [], heartRates: [], cadences: [], powers: [], pointCount: 0 };
+}
+
+/**
+ * Splits are derived from cumulative distance, never from raw coordinates, so
+ * FIT uses what its device recorded and GPX/TCX uses catalog-normalized route
+ * progression or nothing at all. Time is allocated to a split in proportion to
+ * the distance covered inside it, so a segment spanning a boundary donates
+ * time to both sides and the split elapsed times still sum to the activity's.
+ *
+ * Accuracy differs by source, and callers should treat the two differently.
+ * Checked against the catalog's own moving time, splits built on supplied
+ * distance agree to within a few percent, while catalog-normalized splits
+ * drift noticeably further: their per-point distance is a scaled estimate of
+ * where the athlete was, not a measurement, so a stretch of dense sampling
+ * absorbs more of the total than it should. Every split reports its
+ * distanceSource for exactly this reason.
+ */
+export function deriveSplits(points: readonly SplitPoint[], intervalKind: IntervalKind, distanceSource: DistanceSource): SplitDerivation {
+  const intervalMeters = INTERVAL_METERS[intervalKind];
+  const base = { intervalKind, intervalMeters, distanceSource } as const;
+  if (distanceSource === "none") {
+    return { ...base, splits: [], totalDistanceMeters: null, withheldReason: "No usable distance source, so distance-based splits cannot be derived." };
+  }
+  const usable = points.filter((point) => point.distanceMeters !== null && Number.isFinite(point.distanceMeters));
+  if (usable.length < 2) {
+    return { ...base, splits: [], totalDistanceMeters: null, withheldReason: "Too few points carry a distance for distance-based splits." };
+  }
+  // The furthest point reached, not the last one recorded. activity_bounds
+  // stores MAX(distance_meters), and a device that pauses, resumes, or emits
+  // a corrupt final record can leave the last value below the maximum; taking
+  // the last would then size the splits to less than the activity's own
+  // reported distance. Reduced rather than spread, since a long ride carries
+  // tens of thousands of points.
+  const total = usable.reduce((furthest, point) => Math.max(furthest, point.distanceMeters!), 0);
+  const firstDistance = usable.reduce((nearest, point) => Math.min(nearest, point.distanceMeters!), Infinity);
+  if (!(total > 0)) {
+    return { ...base, splits: [], totalDistanceMeters: total, withheldReason: "Total distance is zero, so there are no splits to derive." };
+  }
+
+  const bucketCount = Math.max(1, Math.ceil(total / intervalMeters));
+  const buckets: Accumulator[] = Array.from({ length: bucketCount }, emptyAccumulator);
+  const bucketFor = (distance: number) => Math.min(bucketCount - 1, Math.max(0, Math.floor(distance / intervalMeters)));
+
+  for (const point of usable) {
+    const bucket = buckets[bucketFor(point.distanceMeters!)]!;
+    bucket.pointCount += 1;
+    bucket.altitudes.push(point.altitudeMeters);
+    if (point.heartRate !== null) bucket.heartRates.push(point.heartRate);
+    if (point.cadence !== null) bucket.cadences.push(point.cadence);
+    if (point.powerWatts !== null) bucket.powers.push(point.powerWatts);
+    const time = millis(point.timestamp);
+    if (time !== null) {
+      bucket.firstTime = bucket.firstTime === null ? time : Math.min(bucket.firstTime, time);
+      bucket.lastTime = bucket.lastTime === null ? time : Math.max(bucket.lastTime, time);
+    }
+  }
+
+  // A stop spans many segments when a device keeps sampling through it, so a
+  // pause is counted once, where it begins, and only once it has lasted long
+  // enough to be a stop rather than a wobble across the speed threshold.
+  let pauseRunSeconds = 0; let pauseRunBucket = 0; let pauseRunCounted = false;
+  for (let index = 1; index < usable.length; index += 1) {
+    const previous = usable[index - 1]!; const current = usable[index]!;
+    const startDistance = previous.distanceMeters!; const endDistance = current.distanceMeters!;
+    const previousTime = millis(previous.timestamp); const currentTime = millis(current.timestamp);
+    if (previousTime === null || currentTime === null) continue;
+    const seconds = (currentTime - previousTime) / 1000;
+    if (seconds <= 0) continue;
+    const distanceDelta = endDistance - startDistance;
+    const speed = distanceDelta / seconds;
+    const paused = speed < PAUSE_SPEED_METERS_PER_SECOND;
+    const recordingGap = !paused && seconds > RECORDING_GAP_SECONDS;
+    if (!paused) { pauseRunSeconds = 0; pauseRunCounted = false; }
+    else {
+      if (pauseRunSeconds === 0) { pauseRunBucket = bucketFor(startDistance); pauseRunCounted = false; }
+      pauseRunSeconds += seconds;
+      if (!pauseRunCounted && pauseRunSeconds >= MIN_PAUSE_SECONDS) {
+        buckets[pauseRunBucket]!.pauseCount += 1;
+        pauseRunCounted = true;
+      }
+    }
+
+    if (distanceDelta <= 0) {
+      // Standing still covers no ground, so the whole interval belongs to the
+      // split the athlete was standing in.
+      const bucket = buckets[bucketFor(startDistance)]!;
+      bucket.elapsedSeconds += seconds;
+      bucket.pausedSeconds += paused ? seconds : 0;
+      continue;
+    }
+
+    const firstBucket = bucketFor(startDistance); const lastBucket = bucketFor(endDistance);
+    if (recordingGap) buckets[firstBucket]!.recordingGapCount += 1;
+    for (let bucketIndex = firstBucket; bucketIndex <= lastBucket; bucketIndex += 1) {
+      const bucketStart = bucketIndex * intervalMeters;
+      const bucketEnd = bucketStart + intervalMeters;
+      const overlap = Math.min(endDistance, bucketEnd) - Math.max(startDistance, bucketStart);
+      if (overlap <= 0) continue;
+      const share = (overlap / distanceDelta) * seconds;
+      const bucket = buckets[bucketIndex]!;
+      bucket.elapsedSeconds += share;
+      if (paused) bucket.pausedSeconds += share;
+    }
+  }
+
+  const splits = buckets.map((bucket, sequence) => {
+    const startDistanceMeters = sequence * intervalMeters;
+    const endDistanceMeters = Math.min(total, startDistanceMeters + intervalMeters);
+    // A stream that begins part-way into an interval — a resumed device whose
+    // first record already carries distance — covers less ground than the
+    // interval spans. Measuring from where the recording actually starts keeps
+    // pace honest instead of dividing a short time by a full kilometre.
+    const coveredFrom = Math.max(startDistanceMeters, firstDistance);
+    const distanceMeters = Math.max(0, endDistanceMeters - coveredFrom);
+    const elapsedSeconds = bucket.elapsedSeconds > 0 ? bucket.elapsedSeconds : null;
+    const movingSeconds = elapsedSeconds === null ? null : Math.max(0, elapsedSeconds - bucket.pausedSeconds);
+    const elevation = elevationChangeMeters(bucket.altitudes, ELEVATION_NOISE_THRESHOLD_METERS);
+    const averageHeartRate = average(bucket.heartRates);
+    const averageCadence = average(bucket.cadences);
+    const averagePowerWatts = average(bucket.powers);
+    const metricsAvailable = [
+      ...(bucket.heartRates.length > 0 ? ["heartRate"] : []),
+      ...(bucket.cadences.length > 0 ? ["cadence"] : []),
+      ...(bucket.powers.length > 0 ? ["powerWatts"] : []),
+      ...(elevation !== null ? ["elevation"] : []),
+    ];
+    return {
+      sequence, startDistanceMeters, endDistanceMeters, distanceMeters,
+      complete: distanceMeters >= intervalMeters - 1e-6,
+      startedAt: bucket.firstTime === null ? null : new Date(bucket.firstTime).toISOString(),
+      endedAt: bucket.lastTime === null ? null : new Date(bucket.lastTime).toISOString(),
+      elapsedSeconds, movingSeconds,
+      pausedSeconds: bucket.pausedSeconds, pauseCount: bucket.pauseCount,
+      recordingGapCount: bucket.recordingGapCount,
+      // Pace uses moving time, so a long stop does not read as a slow split.
+      paceSecondsPerKm: movingSeconds !== null && movingSeconds > 0 && distanceMeters > 0 ? (movingSeconds * 1000) / distanceMeters : null,
+      averageHeartRate, maxHeartRate: bucket.heartRates.length > 0 ? Math.max(...bucket.heartRates) : null,
+      averageCadence, averagePowerWatts,
+      elevationGainMeters: elevation?.gainMeters ?? null,
+      elevationLossMeters: elevation?.lossMeters ?? null,
+      pointCount: bucket.pointCount, metricsAvailable,
+    };
+  });
+
+  return { ...base, splits, totalDistanceMeters: total, withheldReason: null };
+}

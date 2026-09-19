@@ -10,6 +10,9 @@ import { closeDatabase, openDatabase, type Database } from "./database.js";
 import { guardTool, logInternalError, toolFailure, toolSuccess, type ToolResult } from "./errors.js";
 import { getActivityRoute, getActivityStream, importDetailedActivityFiles } from "./details.js";
 import { getGear, importGear } from "./gear.js";
+import { importMedia, listMedia } from "./media.js";
+import { getChallenges, getClubs, importCommunity } from "./community.js";
+import { getSocialSummary, importSocial } from "./social.js";
 import { MAX_GROUPS } from "./limits.js";
 import { analyzeActivity, compareTrainingPeriods, getPersonalBests, getSportSummary, getTrainingLoad, listSports } from "./training.js";
 import { validateExport } from "./validator.js";
@@ -67,10 +70,10 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_detailed_activities",
     {
       title: "Import detailed activities",
-      description: "Decodes linked GPX, FIT, compressed FIT, and compressed TCX files into the local database. Source files are never changed; per-file failures do not stop the remaining import.",
-      inputSchema: z.object({ activityId: z.string().trim().min(1).optional() }),
+      description: "Decodes linked GPX, FIT, compressed FIT, and compressed TCX files into the local database. A file whose bytes and derivation versions are unchanged since its last successful decode is reported as unchanged rather than decoded again; pass force to decode regardless. Source files are never changed; per-file failures do not stop the remaining import.",
+      inputSchema: z.object({ activityId: z.string().trim().min(1).optional(), force: z.boolean().default(false) }),
     },
-    async ({ activityId }) => withExport(config, "import_detailed_activities", (exportDir, database) => importDetailedActivityFiles(exportDir, database, activityId, config.timeZone)),
+    async ({ activityId, force }) => withExport(config, "import_detailed_activities", (exportDir, database) => importDetailedActivityFiles(exportDir, database, activityId, config.timeZone, force)),
   );
 
   server.registerTool(
@@ -78,7 +81,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     {
       title: "Get activity stream", description: "Returns bounded imported telemetry. Coordinates are withheld unless includeLocation is explicitly true, and that opt-in applies only to the single request that sets it.",
       inputSchema: z.object({
-        activityId: z.string().trim().min(1), fields: z.array(z.enum(["timestamp", "altitudeMeters", "distanceMeters", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond", "latitude", "longitude"])).max(9).optional(),
+        activityId: z.string().trim().min(1), fields: z.array(z.enum(["timestamp", "altitudeMeters", "distanceMeters", "distanceSource", "heartRate", "cadence", "powerWatts", "speedMetersPerSecond", "latitude", "longitude"])).max(10).optional(),
         includeLocation: z.boolean().default(false),
         maxPoints: z.number().int().min(1).max(MAX_STREAM_POINTS).optional(), startTime: optionalDate, endTime: optionalDate,
       }).refine((input) => input.startTime === undefined || input.endTime === undefined || input.startTime < input.endTime, { message: "startTime must be before endTime." }),
@@ -140,10 +143,14 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
   server.registerTool(
     "analyze_activity",
     {
-      title: "Analyze activity", description: "Provides catalog-level activity analysis. Split-based pacing and telemetry progression are not implemented; decoded telemetry is available through get_activity_stream and get_activity_route.",
-      inputSchema: z.object({ activityId: z.string().trim().min(1), analysisType: z.enum(["catalogSummary", "pace", "intensity"]).default("catalogSummary") }),
+      title: "Analyze activity", description: "Analyzes one activity from the catalog, or from decoded telemetry for the splits, progression, and pauses types. Telemetry analysis states whether its interval boundaries are file-supplied or catalog-normalized, and falls back to catalog-level analysis with a stated reason when no eligible route exists. Never returns coordinates.",
+      inputSchema: z.object({
+        activityId: z.string().trim().min(1),
+        analysisType: z.enum(["catalogSummary", "pace", "intensity", "splits", "progression", "pauses"]).default("catalogSummary"),
+        intervalKind: z.enum(["km", "mile"]).default("km"),
+      }),
     },
-    async ({ activityId, analysisType }) => withDatabase(config, "analyze_activity", (database) => analyzeActivity(database, activityId, analysisType)),
+    async ({ activityId, analysisType, intervalKind }) => withDatabase(config, "analyze_activity", (database) => analyzeActivity(database, activityId, analysisType, intervalKind)),
   );
 
   server.registerTool(
@@ -192,13 +199,61 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
     "import_supporting_data",
     {
       title: "Import supporting data",
-      description: "Imports the export's supporting domains, currently gear, into the local database. Reuses the latest validation snapshot and never changes the source export.",
+      description: "Imports the export's supporting domains, currently gear, media references, challenges, clubs, memberships and an aggregate social summary, into the local database. Reuses the latest validation snapshot and never changes the source export.",
       inputSchema: z.object({}),
     },
     async () => withExport(config, "import_supporting_data", async (exportDir, database) => {
       const snapshotId = await latestSnapshotId(exportDir, database);
-      return { snapshotId, domains: await importGear(exportDir, database, snapshotId) };
+      return { snapshotId, domains: [...await importGear(exportDir, database, snapshotId), ...await importMedia(exportDir, database, snapshotId), ...await importCommunity(exportDir, database, snapshotId), ...await importSocial(exportDir, database, snapshotId)] };
     }),
+  );
+
+  server.registerTool(
+    "get_social_summary",
+    {
+      title: "Get social summary",
+      description: "Returns aggregate counts of outbound social activity: follower and following totals, reactions by type and parent type, and reaction and comment counts by month. Only counts are stored, so no third-party athlete identifier and no comment text can be returned. Kudos and comments received are absent from a Strava export and are not reported.",
+      inputSchema: z.object({}),
+    },
+    async () => withDatabase(config, "get_social_summary", (database) => getSocialSummary(database)),
+  );
+
+  server.registerTool(
+    "get_challenges",
+    {
+      title: "Get challenges",
+      description: "Lists imported global and group challenges with join dates and completion, paginated.",
+      inputSchema: z.object({
+        scope: z.enum(["global", "group"]).optional(), completed: z.boolean().optional(),
+        page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+      }),
+    },
+    async (input) => withDatabase(config, "get_challenges", (database) => getChallenges(database, input)),
+  );
+
+  server.registerTool(
+    "get_clubs",
+    {
+      title: "Get clubs",
+      description: "Lists imported clubs and the account's memberships, paginated. A club named only by a membership is reported with its name alone.",
+      inputSchema: z.object({ page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional() }),
+    },
+    async (input) => withDatabase(config, "get_clubs", (database) => getClubs(database, input)),
+  );
+
+  server.registerTool(
+    "list_media",
+    {
+      title: "List media",
+      description: "Lists imported media references with their captions and activity links, paginated. Only validated relative paths and captions are stored: no media bytes are read and no EXIF, including location, is extracted.",
+      inputSchema: z.object({
+        activityId: z.string().trim().min(1).optional(),
+        source: z.enum(["media-file", "activity-catalog-only"]).optional(),
+        fileStatus: z.enum(["present", "missing"]).optional(),
+        page: z.number().int().min(1).optional(), pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).optional(),
+      }),
+    },
+    async (input) => withDatabase(config, "list_media", (database) => listMedia(database, input)),
   );
 
   server.registerTool(
@@ -222,7 +277,7 @@ export function createServer(config: ServerConfig = loadConfig()): McpServer {
 
   server.registerTool(
     "get_data_schema",
-    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear"]).optional() }) },
+    { title: "Get data schema", description: "Describes available imported fields, units, and privacy classification.", inputSchema: z.object({ domain: z.enum(["activities", "catalog", "gear", "splits", "media", "challenges", "clubs", "social"]).optional() }) },
     async ({ domain }) => withDatabase(config, "get_data_schema", (database) => getDataSchema(database, domain)),
   );
 
